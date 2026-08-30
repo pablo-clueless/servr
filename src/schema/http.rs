@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Meta {
     pub headers: HashMap<String, String>,
     pub ip: String,
     pub user_agent: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Response<T> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
