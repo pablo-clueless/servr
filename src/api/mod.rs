@@ -3,10 +3,10 @@ use crate::schema::http::Response;
 use crate::schema::queue::Job;
 use crate::state::SharedState;
 use axum::{
-    Router,
     extract::{ConnectInfo, Json, State},
     http::HeaderMap,
     routing::{get, post},
+    Router,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -26,9 +26,7 @@ pub fn create_router() -> Router<SharedState> {
         .route("/email", post(email_handler))
 }
 
-async fn health_handler(
-    headers: HeaderMap,
-) -> Json<Response<String>> {
+async fn health_handler(headers: HeaderMap) -> Json<Response<String>> {
     info!("Health check hit");
     let ua = headers
         .get("user-agent")
@@ -45,9 +43,7 @@ async fn health_handler(
     ))
 }
 
-async fn ping_handler(
-    headers: HeaderMap,
-) -> Json<Response<String>> {
+async fn ping_handler(headers: HeaderMap) -> Json<Response<String>> {
     info!("Ping endpoint hit");
     let ua = headers
         .get("user-agent")
@@ -81,13 +77,12 @@ async fn webhook_handler(
         payload: serde_json::to_value(&payload).map_err(|e| AppError::Internal(e.to_string()))?,
     };
 
-    state
-        .job_tx
-        .try_send(job)
-        .map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => AppError::TooManyRequests,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::QueueError("Queue closed".to_string()),
-        })?;
+    state.job_tx.try_send(job).map_err(|e| match e {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => AppError::TooManyRequests,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            AppError::QueueError("Queue closed".to_string())
+        }
+    })?;
 
     Ok(Json(Response::new(
         Some("Webhook enqueued".to_string()),
@@ -117,13 +112,12 @@ async fn email_handler(
         .unwrap_or("unknown");
 
     let job = Job::SendEmail(email);
-    state
-        .job_tx
-        .try_send(job)
-        .map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => AppError::TooManyRequests,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::QueueError("Queue closed".to_string()),
-        })?;
+    state.job_tx.try_send(job).map_err(|e| match e {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => AppError::TooManyRequests,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            AppError::QueueError("Queue closed".to_string())
+        }
+    })?;
 
     Ok(Json(Response::new(
         Some("Email enqueued".to_string()),

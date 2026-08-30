@@ -1,8 +1,8 @@
 use crate::schema::http::Response;
 use axum::{
-    Json,
     http::StatusCode,
     response::{IntoResponse, Response as AxumResponse},
+    Json,
 };
 use thiserror::Error;
 
@@ -36,9 +36,11 @@ impl IntoResponse for AppError {
             AppError::NotFound(ref msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::SmtpError(ref msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::QueueError(ref msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-            AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Job queue is full".to_string()),
+            AppError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Job queue is full".to_string(),
+            ),
         };
-
 
         let body = Response::<()> {
             data: None,

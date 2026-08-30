@@ -15,7 +15,10 @@ async fn handle_socket(mut socket: WebSocket) {
         match msg {
             Ok(Message::Text(text)) => {
                 info!("WebSocket received text: {}", text);
-                if let Err(e) = socket.send(Message::Text(format!("Echo: {}", text).into())).await {
+                if let Err(e) = socket
+                    .send(Message::Text(format!("Echo: {}", text).into()))
+                    .await
+                {
                     error!("WebSocket send error while echoing text: {}", e);
                     break;
                 }
@@ -29,7 +32,10 @@ async fn handle_socket(mut socket: WebSocket) {
             }
             Ok(Message::Close(frame)) => {
                 if let Some(cf) = frame {
-                    info!("WebSocket closing with code {} and reason: {}", cf.code, cf.reason);
+                    info!(
+                        "WebSocket closing with code {} and reason: {}",
+                        cf.code, cf.reason
+                    );
                 } else {
                     info!("WebSocket closing without frame");
                 }
