@@ -50,7 +50,13 @@ async fn main() {
         mailer: mailer.clone(),
         job_tx,
         db: db.clone(),
+        users: std::sync::RwLock::new(std::collections::HashMap::new()),
+        posts: std::sync::RwLock::new(std::collections::HashMap::new()),
+        albums: std::sync::RwLock::new(std::collections::HashMap::new()),
     });
+
+    crate::state::seed_data(&state);
+
 
     let worker_mailer = mailer.clone();
     tokio::spawn(async move {
