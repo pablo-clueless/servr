@@ -4076,6 +4076,7 @@ version = "9.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d047458f1b5b65237c2f6dc6db136945667f40a7668627b3490b9513a3d43a55"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "mime_guess",
  "regex",

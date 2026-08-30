@@ -21,6 +21,9 @@ mod tests {
             db: Arc::new(Database {
                 url: "mock".to_string(),
             }),
+            users: std::sync::RwLock::new(std::collections::HashMap::new()),
+            posts: std::sync::RwLock::new(std::collections::HashMap::new()),
+            albums: std::sync::RwLock::new(std::collections::HashMap::new()),
         });
         create_router().with_state(state)
     }
