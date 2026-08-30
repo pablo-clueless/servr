@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0.104"
 apalis = "0.7.4"
 apalis-sql = "0.7.4"
-argon2 = "0.6.0"
+argon2 = "0.5.3"
 axum = { version = "0.8.9", features = ["ws"] }
 chrono = "0.4.45"
 config = "0.15.25"
