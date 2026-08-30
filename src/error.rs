@@ -2,11 +2,11 @@ use crate::schema::http::Response;
 use axum::{
     Json,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response as AxumResponse},
 };
-use serde::Serialize;
 use thiserror::Error;
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("Internal server error: {0}")]
@@ -29,7 +29,7 @@ pub enum AppError {
 }
 
 impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> AxumResponse {
         let (status, error_message) = match self {
             AppError::Internal(ref msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::BadRequest(ref msg) => (StatusCode::BAD_REQUEST, msg.clone()),

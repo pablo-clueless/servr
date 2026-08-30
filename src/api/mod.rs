@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::schema::http::Response;
 use crate::schema::queue::Job;
-use crate::state::{AppState, SharedState};
+use crate::state::SharedState;
 use axum::{
     Router,
     extract::{ConnectInfo, Json, State},
@@ -10,16 +10,15 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tracing::info;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 pub struct WebhookPayload {
     pub event: String,
     pub data: serde_json::Value,
 }
 
-pub fn create_router() -> Router {
+pub fn create_router() -> Router<SharedState> {
     Router::new()
         .route("/health", get(health_handler))
         .route("/ping", get(ping_handler))
@@ -28,10 +27,9 @@ pub fn create_router() -> Router {
 }
 
 async fn health_handler(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Json<Response<String>> {
-    info!("Health check hit from {}", addr);
+    info!("Health check hit");
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -42,16 +40,15 @@ async fn health_handler(
         200,
         "GET",
         "/health",
-        &addr.to_string(),
+        "unknown",
         ua,
     ))
 }
 
 async fn ping_handler(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Json<Response<String>> {
-    info!("Ping endpoint hit from {}", addr);
+    info!("Ping endpoint hit");
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -62,7 +59,7 @@ async fn ping_handler(
         200,
         "GET",
         "/ping",
-        &addr.to_string(),
+        "unknown",
         ua,
     ))
 }

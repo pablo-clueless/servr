@@ -1,3 +1,4 @@
+use crate::config::Config;
 use reqwest::Client;
 use std::time::Duration;
 use tokio::time::interval;
@@ -5,7 +6,9 @@ use tracing::{error, info};
 
 pub async fn start_self_ping(endpoint: String) {
     info!("Self-ping background task started targeting {}", endpoint);
-    let mut timer = interval(Duration::from_secs(600)); // 10 minutes
+
+    let cfg = Config::from_env();
+    let mut timer = interval(Duration::from_secs(cfg.self_ping_interval));
     let client = Client::new();
 
     loop {

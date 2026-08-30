@@ -50,6 +50,7 @@ impl<T> Response<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn error(message: &str, status: u16, method: &str, path: &str, ip: &str, ua: &str) -> Self {
         Self {
             data: None,
@@ -69,6 +70,7 @@ impl<T> Response<T> {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pagination {
     pub has_next: bool,
@@ -79,6 +81,7 @@ pub struct Pagination {
     pub total_pages: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Paginated<T> {
     pub data: Vec<T>,

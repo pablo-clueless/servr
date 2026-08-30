@@ -4,9 +4,9 @@ mod tests {
     use crate::smtp::SmtpService;
     use crate::state::{AppState, Database};
     use axum::{
-        Router,
         body::Body,
         http::{Request, StatusCode},
+        Router,
     };
     use std::sync::Arc;
     use tokio::sync::mpsc;

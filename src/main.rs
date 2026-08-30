@@ -12,12 +12,12 @@ mod websocket;
 
 use crate::config::Config;
 use crate::smtp::SmtpService;
-use crate::state::{AppState, Database, SharedState};
-use axum::{Router, routing::get};
+use crate::state::{AppState, Database};
+use axum::{routing::get, Router};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() {
@@ -65,13 +65,14 @@ async fn main() {
     let app = Router::new()
         .merge(api::create_router())
         .route("/ws", get(websocket::ws_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = format!("0.0.0.0:{}", cfg.server_port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     tracing::info!("Server listening on http://{}", addr);
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();

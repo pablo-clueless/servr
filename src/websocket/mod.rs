@@ -2,7 +2,6 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
 use tracing::{error, info};
 
 pub async fn ws_handler(ws: WebSocketUpgrade) -> Response {
@@ -16,7 +15,7 @@ async fn handle_socket(mut socket: WebSocket) {
         match msg {
             Ok(Message::Text(text)) => {
                 info!("WebSocket received text: {}", text);
-                if let Err(e) = socket.send(Message::Text(format!("Echo: {}", text))).await {
+                if let Err(e) = socket.send(Message::Text(format!("Echo: {}", text).into())).await {
                     error!("WebSocket send error while echoing text: {}", e);
                     break;
                 }
