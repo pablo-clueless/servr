@@ -1,0 +1,13 @@
+[package]
+name = "testbed-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# INVARIANT: depends only on `core` (HANDOFF §4).
+[dependencies]
+testbed-core.workspace = true
+
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,18 @@
+# Prometheus for the `obs` compose profile.
+#
+# Phase 8's cardinality_bomb is expected to degrade this instance. That is the
+# test, not a misconfiguration — see HANDOFF §7 phase 8.
+
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # The testbed runs on the host, not in compose.
+  - job_name: testbed
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  # Metrics arriving over OTLP and re-exported by the collector.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]

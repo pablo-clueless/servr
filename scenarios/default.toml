@@ -1,0 +1,27 @@
+# The boot scenario. Seeds `base`; `POST /_admin/reset` returns here.
+#
+# This file must stay inert: no faults, no telemetry corruption. A test that
+# starts the testbed and asserts normal behaviour is asserting against this.
+# Fault-injecting scenarios live alongside it (flaky-api, slow-queue,
+# chatty-ws, webhook-storm, broken-traces, cardinality-bomb) and are selected
+# with --scenario.
+
+name = "default"
+description = "Inert baseline. Every surface behaves correctly."
+blast_radius = "None. Emits normal telemetry to the configured collector."
+
+# Fault rules matched per request by the tower layer in crates/http.
+# Empty means the layer is installed but never fires.
+faults = []
+
+# Outbound webhook destinations, with per-endpoint signing (Q4).
+webhooks = []
+
+# Telemetry corruption, applied in the exporter shim only.
+# All fields default to off; listed here as documentation of the surface.
+[telemetry]
+rate = 0.0
+orphan_spans = false
+drop_export = false
+corrupt_inbound_traceparent = false
+counter_reset = false

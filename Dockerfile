@@ -1,23 +1,18 @@
-# Build stage
-FROM rust:1.98-alpine3.21 AS builder
+# The testbed normally runs on the host against the compose data plane; this
+# image exists for CI and for pointing remote tooling at a deployed instance.
 
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 COPY . .
-# Use generic target CPU to avoid unstable SIMD feature errors in some crates
 ENV RUSTFLAGS="-C target-cpu=generic"
-RUN cargo build --release
+RUN cargo build --release -p testbed-server
 
-# Runtime stage
-FROM debian:bullseye-slim
-
+FROM debian:bookworm-slim
 WORKDIR /app
-COPY --from=builder /app/target/release/servr /app/servr
-
-# Install runtime dependencies (like openssl and ca-certificates for SMTP/HTTP)
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
-
+COPY --from=builder /app/target/release/testbed /app/testbed
+COPY --from=builder /app/scenarios /app/scenarios
 EXPOSE 8080
-CMD ["./servr"]
+CMD ["./testbed"]

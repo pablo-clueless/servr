@@ -1,60 +1,61 @@
 .PHONY: help
 help:
 	@echo ""
-	@echo "  env           Copy .env.example -> .env"
-	@echo "  run           Build and run the server"
-	@echo "  test          Run Rust tests"
-	@echo "  fmt           Format code with cargo fmt"
-	@echo "  clippy       Run cargo clippy"
+	@echo "  up            Start the data plane (postgres, redis, mailpit)"
+	@echo "  up-obs        Start data plane + collector, jaeger, prometheus"
+	@echo "  down          Stop compose and drop volumes"
+	@echo "  run           Run the testbed server on :8080"
+	@echo "  test          cargo test --workspace"
+	@echo "  fmt           cargo fmt --all"
+	@echo "  clippy        cargo clippy --workspace --all-targets -D warnings"
+	@echo "  invariants    Run the grep gates CI enforces"
+	@echo "  gate-0        Phase 0 gate: infra healthy + workspace builds"
 	@echo ""
-	@echo "  migrate-up    Run database migrations"
-	@echo "  migrate-down   Rollback database migrations"
-	@echo ""
-	@echo "  docker-up     Start server in docker"
-	@echo "  docker-down    Stop docker containers"
+	@echo "  Jaeger  http://localhost:16686   Mailpit http://localhost:8025"
+	@echo "  Prom    http://localhost:9090    Admin   http://localhost:8080/_admin/health"
 	@echo ""
 
-.PHONY: env
-env:
-	if [ ! -f .env ]; then \
-		cp .env.example .env; \
-		echo "created .env"; \
-	else \
-		echo "skipped .env (already exists)"; \
-	fi
+.PHONY: up
+up:
+	docker compose up -d --wait
+
+.PHONY: up-obs
+up-obs:
+	docker compose --profile obs up -d --wait
+
+.PHONY: down
+down:
+	docker compose down -v
 
 .PHONY: run
 run:
-	cargo run
+	cargo run -p testbed-server
 
 .PHONY: test
 test:
-	cargo test
+	cargo test --workspace
 
 .PHONY: fmt
 fmt:
-	cargo fmt
+	cargo fmt --all
 
 .PHONY: clippy
 clippy:
-	cargo clippy -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
-.PHONY: migrate-up
-migrate-up:
-	@echo "Running migrations..."
-	# Assuming use of a tool like 'golang-migrate' or similar, or a custom script
-	# Example using psql:
-	# psql  -f migrations/001_initial_schema.sql
+# Invariant 1 (HANDOFF §5). Exit 0 means no violations.
+.PHONY: invariants
+invariants:
+	@if rg -n 'SystemTime::now|Instant::now' crates/ server/ \
+	      --glob '!crates/core/src/clock.rs' \
+	      --glob '!crates/telemetry/src/wall.rs'; then \
+	  echo "FAIL: wall-clock read outside the two sanctioned files"; exit 1; \
+	else echo "ok: no wall-clock reads outside clock.rs and wall.rs"; fi
+	@if rg -n 'sqlx|postgres|PgPool' crates/admin/; then \
+	  echo "FAIL: control plane touches Postgres"; exit 1; \
+	else echo "ok: control plane performs no Postgres I/O"; fi
 
-.PHONY: migrate-down
-migrate-down:
-	@echo "Rolling back migrations..."
-	# Example: psql  -c "DROP TABLE email_logs; DROP TABLE jobs;"
-
-.PHONY: docker-up
-docker-up:
-	docker compose up -d
-
-.PHONY: docker-down
-docker-down:
-	docker compose down
+.PHONY: gate-0
+gate-0: up invariants
+	docker compose ps --format '{{.Service}} {{.Health}}'
+	cargo build --workspace 2>&1 | tail -1

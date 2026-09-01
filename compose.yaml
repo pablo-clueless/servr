@@ -1,0 +1,97 @@
+# Data plane, plus an observability stack behind the `obs` profile.
+#
+# Healthchecks are not hygiene here (trap T2). Without them the server races
+# infra on cold boot and CI fails intermittently in a way that looks like flaky
+# tests. Every service the server depends on declares one, and the server waits
+# on `condition: service_healthy`.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-testbed}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-testbed}
+      POSTGRES_DB: ${POSTGRES_DB:-testbed}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-testbed} -d ${POSTGRES_DB:-testbed}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Owns SMTP *and* the read API (HANDOFF §2 decision 6). No embedded SMTP.
+  # Mailpit does not namespace (T7) — isolation is the X-Testbed-Run header on
+  # send plus filtering on read, and nothing else.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # HTTP / REST
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- profile: obs -------------------------------------------------------
+  # The app only ever speaks OTLP to a collector endpoint (Q5), so what runs
+  # behind it is a compose-file concern. Kept out of the base stack because
+  # Phase 8's cardinality_bomb will genuinely degrade Prometheus — that is the
+  # test, and this profile is the blast radius.
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    profiles: ["obs"]
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "8889:8889" # Prometheus scrape target
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI + query API, which the Phase 2b/4 gates curl
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["obs"]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+volumes:
+  pgdata:

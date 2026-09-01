@@ -1,41 +1,52 @@
-[package]
-name = "servr"
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/telemetry",
+    "crates/http",
+    "crates/ws",
+    "crates/stream",
+    "crates/queue",
+    "crates/mail",
+    "crates/hooks",
+    "crates/admin",
+    "server",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
-[dependencies]
-anyhow = "1.0.104"
-apalis = "0.7.4"
-apalis-sql = "0.7.4"
-argon2 = "0.5.3"
-axum = { version = "0.8.9", features = ["ws"] }
-chrono = "0.4.45"
-config = "0.15.25"
-dotenvy = "0.15.7"
-futures-util = "0.3.34"
-jsonwebtoken = "11.0.0"
-lettre = { version = "0.11.23", features = ["tokio1", "tokio1-native-tls"] }
-metrics = "0.24.6"
-metrics-exporter-prometheus = "0.18.3"
-opentelemetry = "0.32.0"
-opentelemetry_sdk = "0.32.1"
-reqwest = "0.13.4"
+# Shared versions. Crates opt in via `dep = { workspace = true }` so a version
+# bump happens in exactly one place.
+[workspace.dependencies]
+testbed-core = { path = "crates/core" }
+testbed-telemetry = { path = "crates/telemetry" }
+testbed-http = { path = "crates/http" }
+testbed-ws = { path = "crates/ws" }
+testbed-stream = { path = "crates/stream" }
+testbed-queue = { path = "crates/queue" }
+testbed-mail = { path = "crates/mail" }
+testbed-hooks = { path = "crates/hooks" }
+testbed-admin = { path = "crates/admin" }
+
+arc-swap = "1.7"
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-core = "0.3"
+futures-util = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
-tokio-cron-scheduler = "0.15.1"
-tokio-tungstenite = "0.30.0"
+toml = "0.9"
 tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["trace"] }
 tracing = "0.1.44"
-tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-utoipa = "5.5.0"
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
-validator = "0.21.0"
 
-[dev-dependencies]
-mockall = "0.15.0"
-rstest = "0.26.1"
+[profile.dev]
+# The workspace is small; full debug info costs more link time than it returns.
+debug = 1

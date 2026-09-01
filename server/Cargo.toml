@@ -1,0 +1,26 @@
+[package]
+name = "testbed-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "testbed"
+path = "src/main.rs"
+
+# The only crate permitted to depend on everything (HANDOFF §4).
+[dependencies]
+testbed-core.workspace = true
+testbed-telemetry.workspace = true
+testbed-http.workspace = true
+testbed-ws.workspace = true
+testbed-stream.workspace = true
+testbed-queue.workspace = true
+testbed-mail.workspace = true
+testbed-hooks.workspace = true
+testbed-admin.workspace = true
+
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true

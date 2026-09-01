@@ -2,38 +2,93 @@ name: CI
 
 on:
   pull_request:
-    branches:
-      - main
-      - staging
+    branches: [main, staging]
   push:
-    branches:
-      - main
-      - staging
+    branches: [main, staging]
 
 jobs:
-  build:
+  invariants:
+    name: Invariants
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      # HANDOFF §5 invariant 1. `SystemTime::now` and `Instant::now` are
+      # permitted only in the two sanctioned files. If the queue reads wall
+      # time anywhere, time travel is dead and the whole testbed is untestable.
+      - name: No wall-clock reads outside the two sanctioned files
+        run: |
+          if rg -n 'SystemTime::now|Instant::now' crates/ server/ \
+               --glob '!crates/core/src/clock.rs' \
+               --glob '!crates/telemetry/src/wall.rs'; then
+            echo "::error::wall-clock read outside crates/core/src/clock.rs and crates/telemetry/src/wall.rs"
+            exit 1
+          fi
+
+      # HANDOFF §5 invariant 3. The control plane must survive a full
+      # data-plane wipe, so it never talks to Postgres.
+      - name: Control plane performs no Postgres I/O
+        run: |
+          if rg -n 'sqlx|postgres|PgPool' crates/admin/; then
+            echo "::error::crates/admin must not reach Postgres"
+            exit 1
+          fi
+
+      # HANDOFF §4. `core` depends on nothing else in the workspace.
+      - name: core has no workspace dependencies
+        run: |
+          if rg -n '^testbed-(?!core)' crates/core/Cargo.toml; then
+            echo "::error::crates/core must not depend on another workspace crate"
+            exit 1
+          fi
+
+      # HANDOFF §2 decision 6 and §5 invariant 7. Mailpit owns SMTP.
+      - name: No embedded SMTP server
+        run: |
+          if rg -n 'mailin|smtp-server' --glob 'Cargo.toml' --glob '*/Cargo.toml' .; then
+            echo "::error::Mailpit owns SMTP; do not embed one"
+            exit 1
+          fi
+
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy
-        run: cargo clippy -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run Tests
-        run: cargo test
+      - name: Test
+        run: cargo test --workspace
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --workspace --release
+
+  infra:
+    name: Phase 0 infra gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring up the data plane
+        run: docker compose up -d --wait
+
+      # The Phase 0 gate: all three data-plane services report healthy.
+      - name: All services healthy
+        run: |
+          docker compose ps --format '{{.Service}} {{.Health}}' | sort | tee /tmp/health
+          diff <(sort /tmp/health) <(printf 'mailpit healthy\npostgres healthy\nredis healthy\n' | sort)
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
