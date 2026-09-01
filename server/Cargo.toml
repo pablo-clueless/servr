@@ -21,6 +21,10 @@ testbed-hooks.workspace = true
 testbed-admin.workspace = true
 
 axum.workspace = true
+socket2.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
