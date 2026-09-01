@@ -36,6 +36,15 @@ impl Scenario {
     pub fn from_toml_str(src: &str) -> Result<Self, ConfigError> {
         toml::from_str(src).map_err(|e| ConfigError::Toml(e.to_string()))
     }
+
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let src = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Self::from_toml_str(&src)
+    }
 }
 
 /// The mutable half. Everything the admin API writes lands here, and `reset`
@@ -67,6 +76,14 @@ pub struct Resolved {
     pub faults: Vec<FaultSpec>,
     pub telemetry: TelemetryFault,
     pub webhooks: Vec<WebhookEndpoint>,
+}
+
+impl Resolved {
+    /// Rules applying to `path`, in declaration order. Order matters: later
+    /// rules win when two set the same field.
+    pub fn faults_for(&self, path: &str) -> Vec<&FaultSpec> {
+        self.faults.iter().filter(|f| f.matches(path)).collect()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
