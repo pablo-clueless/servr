@@ -13,12 +13,14 @@ pub mod config;
 pub mod event;
 pub mod fault;
 pub mod run;
+pub mod state;
 pub mod trace;
 
-pub use bus::EventSink;
+pub use bus::{BroadcastBus, EventSink};
 pub use clock::Clock;
 pub use config::{Overlay, Resolved, Scenario};
 pub use event::{ConnId, Dir, Event, EventKind, JobId, JobState, StreamId};
 pub use fault::{FaultSpec, SigningScheme, TelemetryFault, WebhookEndpoint};
-pub use run::RunId;
+pub use run::{RunId, RUN_HEADER};
+pub use state::State;
 pub use trace::{SpanId, TraceId};

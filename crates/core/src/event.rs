@@ -40,6 +40,25 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+impl Event {
+    /// Attaches the trace context active where the event was emitted.
+    ///
+    /// This is the join key between the event stream and the trace tree
+    /// (invariant 9). Only the call site knows the active span, so the bus
+    /// cannot fill it in — an event that reaches the bus without this is
+    /// correlatable with nothing.
+    pub fn with_trace(mut self, trace_id: TraceId, span_id: SpanId) -> Self {
+        self.trace_id = Some(trace_id);
+        self.span_id = Some(span_id);
+        self
+    }
+
+    /// True once the event can be joined against an exported span.
+    pub fn is_joinable(&self) -> bool {
+        self.trace_id.is_some_and(|t| t.is_valid())
+    }
+}
+
 /// `/_admin/events` is the contract a UI would later consume (HANDOFF §10);
 /// this enum is that contract. Tagged representation so consumers can switch on
 /// `.kind` without positional decoding.
