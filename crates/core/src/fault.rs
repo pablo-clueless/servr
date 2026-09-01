@@ -36,6 +36,78 @@ pub struct FaultSpec {
     pub drop_connection: bool,
 }
 
+impl FaultSpec {
+    /// Whether this rule applies to `path`. `*` matches any run of characters,
+    /// so `/api/*` covers `/api/ping` and `/api/items/1` alike.
+    pub fn matches(&self, path: &str) -> bool {
+        glob_match(&self.route, path)
+    }
+
+    /// Total delay to inject, jitter included. Returns `None` when the rule
+    /// specifies no latency.
+    ///
+    /// `roll` is a caller-supplied value in `0.0..1.0` — passed in rather than
+    /// drawn here so the jitter distribution stays testable.
+    pub fn delay_ms(&self, roll: f64) -> Option<u64> {
+        let base = self.latency_ms?;
+        let jitter = self.jitter_ms.map_or(0.0, |j| roll * j as f64);
+        Some(base + jitter as u64)
+    }
+
+    /// Short names of the effects this rule carries, for `EventKind::HttpRequest`
+    /// and the `testbed.faults` span field.
+    pub fn effects(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.latency_ms.is_some() {
+            names.push("latency");
+        }
+        if self.status.is_some() {
+            names.push("status");
+        }
+        if self.truncate_body_at.is_some() {
+            names.push("truncate");
+        }
+        if self.drop_connection {
+            names.push("drop");
+        }
+        names
+    }
+}
+
+/// Wildcard match where `*` stands for any run of characters, including none.
+///
+/// Deliberately not a real glob crate: routes here are short and the semantics
+/// need to be obvious to whoever writes a scenario file, not maximally capable.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    let (mut p, mut t) = (0, 0);
+    // Where to resume if the current `*` turns out to have consumed too little.
+    let (mut star, mut resume) = (None, 0);
+
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'*') {
+            star = Some(p);
+            resume = t;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(s) = star {
+            // Backtrack: let the star swallow one more character.
+            p = s + 1;
+            resume += 1;
+            t = resume;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 impl Default for FaultSpec {
     fn default() -> Self {
         Self {
@@ -149,6 +221,61 @@ mod tests {
         let json = serde_json::to_value(TelemetryFault::default()).unwrap();
         assert!(json.get("clock_skew_ms").is_none());
         assert_eq!(json["rate"], 0.0);
+    }
+
+    #[test]
+    fn route_globs_match_the_way_a_scenario_author_expects() {
+        let spec = |route: &str| FaultSpec {
+            route: route.into(),
+            ..Default::default()
+        };
+
+        assert!(spec("/api/*").matches("/api/ping"));
+        assert!(spec("/api/*").matches("/api/items/1"));
+        assert!(spec("/api/*").matches("/api/"));
+        assert!(!spec("/api/*").matches("/_admin/health"));
+
+        assert!(spec("/*").matches("/anything/at/all"));
+        assert!(spec("*").matches("/_admin/reset"));
+
+        assert!(spec("/api/ping").matches("/api/ping"));
+        assert!(!spec("/api/ping").matches("/api/pin"));
+        assert!(!spec("/api/ping").matches("/api/pingg"));
+
+        // A star in the middle, and one that has to backtrack.
+        assert!(spec("/api/*/items").matches("/api/v1/items"));
+        assert!(spec("/api/*items").matches("/api/v1/items"));
+        assert!(!spec("/api/*/items").matches("/api/v1/items/1"));
+    }
+
+    #[test]
+    fn delay_includes_jitter_but_never_without_a_base_latency() {
+        let jittery = FaultSpec {
+            latency_ms: Some(500),
+            jitter_ms: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(jittery.delay_ms(0.0), Some(500));
+        assert_eq!(jittery.delay_ms(0.5), Some(550));
+        assert_eq!(jittery.delay_ms(0.99), Some(599));
+
+        let jitter_only = FaultSpec {
+            jitter_ms: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(jitter_only.delay_ms(0.9), None);
+    }
+
+    #[test]
+    fn effects_name_every_configured_behaviour() {
+        let spec = FaultSpec {
+            latency_ms: Some(500),
+            status: Some(503),
+            drop_connection: true,
+            ..Default::default()
+        };
+        assert_eq!(spec.effects(), vec!["latency", "status", "drop"]);
+        assert!(FaultSpec::default().effects().is_empty());
     }
 
     #[test]
