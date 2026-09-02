@@ -40,6 +40,9 @@ pub trait EventSink: Send + Sync + 'static {
     /// `testbed_events_dropped_total`, which is how you notice the event log is
     /// lying to you (HANDOFF §7 phase 2b).
     fn dropped(&self) -> u64;
+
+    /// Live subscribers. Exported as `testbed_event_subscribers`.
+    fn subscribers(&self) -> usize;
 }
 
 /// In-process fan-out over `tokio::sync::broadcast` (Q1).
@@ -91,11 +94,6 @@ impl BroadcastBus {
         };
         self.emit(event.clone());
         event
-    }
-
-    /// Number of live subscribers. Backs `testbed_event_subscribers`.
-    pub fn subscribers(&self) -> usize {
-        self.tx.receiver_count()
     }
 }
 
@@ -149,6 +147,10 @@ impl EventSink for BroadcastBus {
 
     fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::SeqCst)
+    }
+
+    fn subscribers(&self) -> usize {
+        self.tx.receiver_count()
     }
 }
 
@@ -287,7 +289,7 @@ mod tests {
             bus.publish(chunk(i));
         }
         assert_eq!(bus.dropped(), 0, "unwatched events are not 'dropped'");
-        assert_eq!(bus.subscribers(), 0);
+        assert_eq!(EventSink::subscribers(&bus), 0);
     }
 
     #[tokio::test]

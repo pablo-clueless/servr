@@ -32,6 +32,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use testbed_core::{Clock, EventKind, FaultSpec};
+use tracing::Instrument;
 
 /// What the matching rules add up to for one request.
 #[derive(Debug, Default)]
@@ -92,8 +93,37 @@ pub async fn layer(
     request: Request,
     next: Next,
 ) -> Response {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
+
+    // Trap T12: fields discovered later must be declared `Empty` up front, or
+    // they can never be recorded.
+    let span = tracing::info_span!(
+        "http.request",
+        otel.name = %format!("{method} {path}"),
+        http.request.method = %method,
+        url.path = %path,
+        { testbed_telemetry::late::HTTP_STATUS } = tracing::field::Empty,
+        { testbed_telemetry::late::HTTP_FAULTS } = tracing::field::Empty,
+        { testbed_telemetry::wall::attr::VIRTUAL_TIME } = tracing::field::Empty,
+        { testbed_telemetry::wall::attr::VIRTUAL_OFFSET_MS } = state.clock().offset_ms(),
+    );
+
+    // The inbound context is *continued*, not replaced. A fresh trace id here
+    // would make frontend RUM impossible to join to backend spans, which is the
+    // single most common reason to point a testbed at anything.
+    //
+    // A failure means there was no usable inbound context, so this span starts
+    // a new trace — the correct fallback, and the observable effect of the
+    // `corrupt_inbound_traceparent` telemetry fault.
+    if span
+        .set_parent(testbed_telemetry::propagation::extract(request.headers()))
+        .is_err()
+    {
+        tracing::trace!("no inbound trace context; starting a new trace");
+    }
 
     let effects = {
         let resolved = state.resolved();
@@ -102,59 +132,94 @@ pub async fn layer(
 
     let started = testbed_telemetry::wall::instant();
 
-    if let Some(delay) = effects.delay {
-        tokio::time::sleep(delay).await;
-    }
+    // `.instrument()`, never `span.enter()`: a span guard held across an
+    // `.await` stays entered while the task is parked, so it would attribute
+    // every concurrently-polled request to whichever one happened to yield last.
+    let response = {
+        let effects = &effects;
+        let request_span = span.clone();
+        async move {
+            if let Some(delay) = effects.delay {
+                tokio::time::sleep(delay).await;
+            }
 
-    let response = if effects.drop_connection {
-        // Hyper has no "abort this connection" hook reachable from here, so the
-        // body errors mid-stream instead. A client sees a truncated transfer,
-        // which is the failure mode being simulated.
-        Response::builder()
-            .status(effects.status.unwrap_or(StatusCode::OK))
-            .body(Body::from_stream(futures_util::stream::once(async {
-                Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other(
-                    "connection dropped by fault injection",
-                ))
-            })))
-            .expect("static response builds")
-    } else if let Some(status) = effects.status {
-        // A status override short-circuits: the handler never runs, which is
-        // what a gateway returning 503 in front of it would do.
-        (status, axum::Json(serde_json::json!({ "fault": "status" }))).into_response()
-    } else {
-        let response = next.run(request).await;
-        match effects.truncate_at {
-            Some(at) => truncate(response, at).await,
-            None => response,
+            if effects.drop_connection {
+                // Hyper has no "abort this connection" hook reachable from
+                // here, so the body errors mid-stream instead. A client sees a
+                // truncated transfer, which is the failure mode being simulated.
+                Response::builder()
+                    .status(effects.status.unwrap_or(StatusCode::OK))
+                    .body(Body::from_stream(futures_util::stream::once(async {
+                        Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other(
+                            "connection dropped by fault injection",
+                        ))
+                    })))
+                    .expect("static response builds")
+            } else if let Some(status) = effects.status {
+                // A status override short-circuits: the handler never runs,
+                // which is what a gateway returning 503 in front of it would do.
+                (status, axum::Json(serde_json::json!({ "fault": "status" }))).into_response()
+            } else {
+                let response = next.run(request).await;
+                match effects.truncate_at {
+                    Some(at) => truncate(response, at).await,
+                    None => response,
+                }
+            }
         }
+        .instrument(request_span)
+        .await
     };
 
-    let latency_ms = (testbed_telemetry::wall::instant() - started).as_millis() as u64;
+    let latency = testbed_telemetry::wall::instant() - started;
     let status = response.status().as_u16();
-    let fired = effects.fired();
+    let virtual_now = state.clock().now();
 
-    // Trace context is attached in Phase 2b; until then these events carry no
-    // join key (invariant 9).
+    // Trap T12: recording the fields declared `Empty` when the span opened.
+    span.record(testbed_telemetry::late::HTTP_STATUS, status);
+    span.record(
+        testbed_telemetry::late::HTTP_FAULTS,
+        effects.names.join(","),
+    );
+    span.record(
+        testbed_telemetry::wall::attr::VIRTUAL_TIME,
+        virtual_now.to_rfc3339().as_str(),
+    );
+
+    testbed_telemetry::metrics::record_request(&method, status, latency, &effects.names);
+
+    if effects.fired() {
+        tracing::debug!(
+            status,
+            latency_ms = latency.as_millis() as u64,
+            faults = %effects.names.join(","),
+            "fault applied"
+        );
+    }
+
+    // Invariant 9: the event carries the trace context of the span it happened
+    // under, which is the only thing that lets the event stream and the trace
+    // tree be read together.
+    let (trace_id, span_id) = match testbed_telemetry::propagation::ids_of(&span.context()) {
+        Some((trace, span)) => (Some(trace), Some(span)),
+        None => (None, None),
+    };
+
     state.bus().emit(testbed_core::Event {
         id: 0,
         run: state.run(),
-        at: state.clock().now(),
+        at: virtual_now,
         wall_at: Clock::wall_now(),
-        trace_id: None,
-        span_id: None,
+        trace_id,
+        span_id,
         kind: EventKind::HttpRequest {
             method,
             path,
             status,
-            latency_ms,
+            latency_ms: latency.as_millis() as u64,
             faults: effects.names,
         },
     });
-
-    if fired {
-        tracing::debug!(status, latency_ms, "fault applied");
-    }
 
     response
 }
