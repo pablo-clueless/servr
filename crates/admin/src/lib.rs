@@ -56,6 +56,41 @@ pub fn router(state: Shared) -> Router {
         .with_state(state)
 }
 
+/// `/metrics`, mounted at the root rather than under `/_admin` because that is
+/// where every Prometheus scrape config looks by default.
+///
+/// Kept separate from [`router`] so it can carry the telemetry handle without
+/// putting it in every other handler's state.
+pub fn metrics_route(state: Shared, telemetry: Arc<testbed_telemetry::Telemetry>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state((state, telemetry))
+}
+
+/// Runtime gauges are sampled here, at scrape time, rather than continuously —
+/// so what a scrape reports is the state at the moment it was asked for.
+///
+/// Trap T14: the clock offset comes from the virtual clock. Anything
+/// time-derived that read wall time would disagree with the domain state it
+/// describes the instant someone advanced the clock.
+async fn metrics(
+    State((state, telemetry)): State<(Shared, Arc<testbed_telemetry::Telemetry>)>,
+) -> impl axum::response::IntoResponse {
+    testbed_telemetry::metrics::observe_runtime(
+        state.bus().dropped(),
+        state.bus().subscribers(),
+        state.clock().offset_ms(),
+    );
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        telemetry.render_metrics(),
+    )
+}
+
 /// Phase 2 gate: `{"status":"ok","run":"<uuid>"}`.
 async fn health(State(state): State<Shared>) -> Json<Value> {
     Json(json!({ "status": "ok", "run": state.run().to_string() }))

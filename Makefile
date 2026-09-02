@@ -59,3 +59,15 @@ invariants:
 gate-0: up invariants
 	docker compose ps --format '{{.Service}} {{.Health}}'
 	cargo build --workspace 2>&1 | tail -1
+
+# Phase 2b gate. Needs the obs profile up.
+.PHONY: gate-2b
+gate-2b:
+	@TP="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"; \
+	curl -s localhost:8080/api/ping -H "traceparent: $$TP" > /dev/null; \
+	sleep 2; \
+	echo "jaeger traceID:"; \
+	curl -s 'localhost:16686/api/traces?service=testbed&limit=1' | jq -r '.data[0].traceID'; \
+	echo "expected:      4bf92f3577b34da6a3ce929d0e0e4736"; \
+	echo "testbed_ metrics:"; \
+	curl -s localhost:8080/metrics | grep -c '^testbed_'
