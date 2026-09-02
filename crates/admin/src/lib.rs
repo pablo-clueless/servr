@@ -56,6 +56,75 @@ pub fn router(state: Shared) -> Router {
         .with_state(state)
 }
 
+/// Run lifecycle. Separate from [`router`] because it is the only part of the
+/// control plane that reaches the data plane — to create and drop schemas — and
+/// keeping that dependency off the main admin state makes the boundary visible.
+///
+/// This does not violate invariant 3. The control plane stores nothing in
+/// Postgres; it issues DDL on request and keeps its own state in memory, so a
+/// full data-plane wipe still leaves the testbed configured.
+pub fn runs_router(data: testbed_http::data::MaybeData) -> Router {
+    Router::new()
+        .route("/_admin/runs", get(list_runs).post(create_run))
+        .route("/_admin/runs/{id}", axum::routing::delete(drop_run))
+        .with_state(data)
+}
+
+/// Phase 3 gate: `{"run":"<uuid>"}`.
+async fn create_run(
+    State(data): State<testbed_http::data::MaybeData>,
+) -> Result<Json<Value>, RunError> {
+    let plane = testbed_http::data::require(&data)?;
+    let run = testbed_core::RunId::new();
+    plane.create_run(run).await?;
+
+    Ok(Json(
+        json!({ "run": run.to_string(), "schema": run.schema() }),
+    ))
+}
+
+async fn list_runs(
+    State(data): State<testbed_http::data::MaybeData>,
+) -> Result<Json<Value>, RunError> {
+    let plane = testbed_http::data::require(&data)?;
+    let runs: Vec<String> = plane.runs().await.iter().map(|r| r.to_string()).collect();
+    Ok(Json(json!({ "runs": runs })))
+}
+
+/// Drops the run's schema and everything in it. The control plane is untouched
+/// — this is the wipe that control-plane state has to survive (invariant 3).
+async fn drop_run(
+    State(data): State<testbed_http::data::MaybeData>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, RunError> {
+    let plane = testbed_http::data::require(&data)?;
+    let run: testbed_core::RunId = id.parse().map_err(|_| RunError::BadId(id.clone()))?;
+    plane.drop_run(run).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RunError {
+    #[error("{0:?} is not a run id")]
+    BadId(String),
+    #[error(transparent)]
+    Data(#[from] testbed_http::data::DataError),
+}
+
+impl axum::response::IntoResponse for RunError {
+    fn into_response(self) -> axum::response::Response {
+        use testbed_http::data::DataError;
+
+        let status = match &self {
+            Self::BadId(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::Data(DataError::Unconfigured) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::Data(DataError::UnknownRun(_)) => axum::http::StatusCode::NOT_FOUND,
+            Self::Data(DataError::Sql(_)) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
 /// `/metrics`, mounted at the root rather than under `/_admin` because that is
 /// where every Prometheus scrape config looks by default.
 ///

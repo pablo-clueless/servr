@@ -54,13 +54,38 @@ async fn main() {
         tracing::warn!(blast_radius = %blast, "scenario blast radius");
     }
 
+    // The data plane is optional. Without Postgres the HTTP, telemetry and
+    // control-plane surfaces all still work, and `/api/items` answers 503 with
+    // an explanation — refusing to boot would make phases 0-2b unusable.
+    let data = match std::env::var("DATABASE_URL") {
+        Ok(url) => match testbed_http::data::DataPlane::connect(&url).await {
+            Ok(plane) => {
+                let plane = Arc::new(plane);
+                if let Err(e) = plane.create_run(run).await {
+                    tracing::warn!("could not prepare the default run's schema: {e}");
+                }
+                tracing::info!(schema = %run.schema(), "data plane ready");
+                Some(plane)
+            }
+            Err(e) => {
+                tracing::warn!("Postgres unreachable ({e}); /api/items will answer 503");
+                None
+            }
+        },
+        Err(_) => {
+            tracing::warn!("DATABASE_URL unset; /api/items will answer 503");
+            None
+        }
+    };
+
     let app = Router::new()
         .merge(testbed_admin::router(Arc::clone(&state)))
+        .merge(testbed_admin::runs_router(data.clone()))
         .merge(testbed_admin::metrics_route(
             Arc::clone(&state),
             Arc::clone(&telemetry),
         ))
-        .merge(testbed_http::router(Arc::clone(&state)));
+        .merge(testbed_http::router_with_data(Arc::clone(&state), data));
 
     let port: u16 = std::env::var("TESTBED_PORT")
         .ok()
