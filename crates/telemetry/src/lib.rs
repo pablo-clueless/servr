@@ -1,5 +1,4 @@
-//! The telemetry spine: subscriber, OTLP export, W3C propagation, metrics, and
-//! the exporter shim that corrupts them on demand.
+//! The telemetry spine: subscriber, OTLP export, W3C propagation, metrics.
 //!
 //! Telemetry is a first-class output surface here, not operator debugging
 //! (HANDOFF §2 decision 9). The testbed is a telemetry *source* you point real
@@ -7,46 +6,151 @@
 //!
 //! # Q5 — resolved
 //!
-//! Operator decision: always export OTLP to a collector endpoint; Jaeger and
-//! Prometheus sit behind the `obs` compose profile so the base stack stays
-//! light. The application only ever speaks OTLP to `OTEL_EXPORTER_OTLP_ENDPOINT`,
-//! so what runs behind that is purely a compose-file concern.
+//! Always export OTLP to a collector endpoint; Jaeger and Prometheus sit behind
+//! the `obs` compose profile so the base stack stays light. The application
+//! speaks only OTLP to `OTEL_EXPORTER_OTLP_ENDPOINT`, so what runs behind that
+//! is purely a compose-file concern.
 //!
-//! # Not yet built — Phase 2b (HANDOFF §9 task 8)
+//! # Still owed — Phase 8
 //!
-//! - `tracing-opentelemetry` layer and the OTLP exporter
-//! - W3C `traceparent` extraction (*continued*, never replaced — a fresh trace
-//!   id means frontend RUM can never join to backend spans) and injection
-//! - `/metrics`, serving RED per surface plus the baseline testbed gauges
-//! - the exporter shim applying [`testbed_core::TelemetryFault`] (invariant 11)
-//! - `shutdown_tracer_provider()` on the signal handler, or the last batch
-//!   vanishes and takes the spans you were investigating with it (trap T11)
+//! The exporter shim applying [`testbed_core::TelemetryFault`]. It goes in the
+//! export path and **only** there (invariant 11): corrupting spans where they
+//! are created poisons the testbed's own debuggability, whereas corrupting them
+//! on the way out confines the damage to what leaves the process.
+//!
+//! The export path is also exempt from invariant 4 — it emits no bus events.
+//! Export emits an event, the event triggers instrumentation, instrumentation
+//! queues a span, export runs again; the batch exporter delays the recursion
+//! just long enough to make it puzzling (trap T13).
 
+pub mod metrics;
+pub mod propagation;
 pub mod wall;
 
+use std::time::Duration;
+
+use metrics_exporter_prometheus::PrometheusHandle;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::Resource;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Service name reported to the collector. The Phase 2b and Phase 4 gates query
+/// Jaeger for `service=testbed`, so this string is part of the contract.
+pub const SERVICE_NAME: &str = "testbed";
+
 /// Reads the collector endpoint from the environment, falling back to the
-/// local collector that `compose --profile obs` brings up.
+/// collector that `compose --profile obs` brings up.
 pub fn otlp_endpoint() -> String {
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string())
 }
 
-/// Service name reported to the collector. The Phase 2b gate queries Jaeger for
-/// `service=testbed`, so this string is part of the contract.
-pub const SERVICE_NAME: &str = "testbed";
+/// Live telemetry. Hold it for the process lifetime and call
+/// [`Telemetry::shutdown`] on the way out.
+pub struct Telemetry {
+    provider: Option<SdkTracerProvider>,
+    prometheus: PrometheusHandle,
+}
 
-/// Installs a stdout subscriber. Phase 2b replaces this with the full stack;
-/// until then the server is not silent.
-pub fn init_console_subscriber() {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+impl Telemetry {
+    /// Renders the Prometheus exposition format for `/metrics`.
+    pub fn render_metrics(&self) -> String {
+        self.prometheus.render()
+    }
 
+    /// Whether spans are actually being exported, or only logged.
+    pub fn exporting(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    /// Flushes the last batch.
+    ///
+    /// # Trap T11
+    ///
+    /// Without this on the signal handler, the OTLP batch exporter drops
+    /// whatever it was holding — which is reliably the spans from whatever you
+    /// were investigating when you hit Ctrl-C.
+    pub fn shutdown(&self) {
+        if let Some(provider) = &self.provider {
+            if let Err(e) = provider.shutdown() {
+                tracing::warn!("tracer shutdown failed, last span batch may be lost: {e}");
+            }
+        }
+    }
+}
+
+/// Installs the subscriber, the OTLP exporter and the Prometheus recorder.
+///
+/// A collector that is unreachable is **not** fatal: the testbed is routinely
+/// run without the `obs` profile, and refusing to boot would make the base
+/// stack useless. Export is skipped and everything else still works.
+pub fn init(run: testbed_core::RunId) -> Telemetry {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,testbed=debug"));
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let provider = build_provider(run);
+    let registry = tracing_subscriber::registry()
         .with(filter)
-        .init();
+        .with(tracing_subscriber::fmt::layer());
+
+    match &provider {
+        Some(provider) => {
+            let tracer = provider.tracer(SERVICE_NAME);
+            registry
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .init();
+        }
+        None => registry.init(),
+    }
+
+    let prometheus = match metrics::install() {
+        Ok(handle) => handle,
+        Err(e) => panic!("{e}"),
+    };
+
+    Telemetry {
+        provider,
+        prometheus,
+    }
+}
+
+fn build_provider(run: testbed_core::RunId) -> Option<SdkTracerProvider> {
+    use opentelemetry_otlp::WithExportConfig;
+
+    let endpoint = otlp_endpoint();
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&endpoint)
+        .with_timeout(Duration::from_secs(3))
+        .build();
+
+    match exporter {
+        Ok(exporter) => Some(
+            SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(
+                    Resource::builder()
+                        .with_service_name(SERVICE_NAME)
+                        // Every span carries the run, so a trace can be tied
+                        // back to the test that produced it.
+                        .with_attribute(KeyValue::new(wall::attr::RUN_ID, run.to_string()))
+                        .build(),
+                )
+                .build(),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "OTLP exporter unavailable at {endpoint} ({e}); traces will not be exported"
+            );
+            None
+        }
+    }
 }
 
 /// Attaching an attribute discovered *after* a span opens — a status code, a
@@ -71,5 +175,10 @@ mod tests {
         if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
             assert_eq!(otlp_endpoint(), "http://localhost:4317");
         }
+    }
+
+    #[test]
+    fn the_service_name_matches_what_the_gates_query() {
+        assert_eq!(SERVICE_NAME, "testbed");
     }
 }
