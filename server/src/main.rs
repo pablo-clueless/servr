@@ -17,7 +17,8 @@ const BUS_CAPACITY: usize = 1024;
 
 #[tokio::main]
 async fn main() {
-    testbed_telemetry::init_console_subscriber();
+    let run = RunId::new();
+    let telemetry = Arc::new(testbed_telemetry::init(run));
 
     let scenario_path =
         std::env::var("TESTBED_SCENARIO").unwrap_or_else(|_| "scenarios/default.toml".to_string());
@@ -31,7 +32,6 @@ async fn main() {
         }
     };
 
-    let run = RunId::new();
     let clock = Arc::new(Clock::new());
     let bus = Arc::new(BroadcastBus::new(BUS_CAPACITY, Arc::clone(&clock), run));
     let state = Arc::new(State::new(scenario, Arc::clone(&clock), bus, run));
@@ -42,16 +42,25 @@ async fn main() {
         schema = %run.schema(),
         faults = state.resolved().faults.len(),
         otlp = %testbed_telemetry::otlp_endpoint(),
+        exporting = telemetry.exporting(),
         "testbed starting"
     );
+    if !telemetry.exporting() {
+        tracing::warn!(
+            "no OTLP collector reachable; run `docker compose --profile obs up -d` for traces"
+        );
+    }
     if let Some(blast) = &state.base().blast_radius {
         tracing::warn!(blast_radius = %blast, "scenario blast radius");
     }
 
     let app = Router::new()
         .merge(testbed_admin::router(Arc::clone(&state)))
-        .merge(testbed_http::router(Arc::clone(&state)))
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .merge(testbed_admin::metrics_route(
+            Arc::clone(&state),
+            Arc::clone(&telemetry),
+        ))
+        .merge(testbed_http::router(Arc::clone(&state)));
 
     let port: u16 = std::env::var("TESTBED_PORT")
         .ok()
@@ -71,6 +80,10 @@ async fn main() {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("server error");
+
+    // Trap T11: flush the last span batch, or it takes the spans from whatever
+    // you were investigating down with it.
+    telemetry.shutdown();
 }
 
 /// Binds dual-stack, so `localhost` reaches the server over either family.
