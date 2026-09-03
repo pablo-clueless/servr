@@ -2068,15 +2068,18 @@ name = "testbed-admin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "futures-util",
  "serde",
  "serde_json",
  "testbed-core",
  "testbed-http",
+ "testbed-queue",
  "testbed-telemetry",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2148,12 +2151,19 @@ name = "testbed-queue"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "testbed-core",
  "testbed-telemetry",
+ "thiserror",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
