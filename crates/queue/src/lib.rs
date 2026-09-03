@@ -1,26 +1,22 @@
 //! Job registry, scheduler, retries, dead-letter queue.
 //!
-//! # Not yet built — Phase 4 (HANDOFF §9 task 10)
+//! # Redis is storage, never a scheduler
 //!
-//! - a poll loop comparing due times against **virtual** now
-//! - retry with backoff, and a DLQ for exhausted jobs
-//! - an `EventKind::JobTransition` per state change
+//! HANDOFF §5 invariant 5. The scheduler is our own poll loop comparing due
+//! times against the virtual clock ([`scheduler`]); Redis only holds jobs and
+//! hands back the ones that are due ([`store`]).
 //!
-//! Redis is storage, never the scheduler (§5 invariant 5).
+//! # Still owed
 //!
-//! Trap T3: the poll must be atomic. `ZRANGEBYSCORE` then `ZREM` is a race and
-//! two pollers will double-deliver; do both in one Lua script. `ZPOPMIN` is not
-//! a substitute — it ignores the score bound, so it pops jobs that are not due.
-//!
-//! Trap T10: a job's execution span **links** to the enqueue span, it does not
-//! descend from it. Parenting is the intuitive choice and it is wrong: a job
-//! delayed 30 minutes then produces a 30-minute trace, and a handful of those
-//! makes every trace-waterfall UI pointed at the testbed unusable. Use
-//! `FOLLOWS_FROM`. The Phase 4 gate asserts it.
+//! The Redis [`store::JobStore`] implementation, with the Lua script that makes
+//! `claim_due` atomic (T3). [`store::MemoryStore`] is the working
+//! implementation today and is what the Phase 4 timing gate runs against; the
+//! trait exists so swapping in Redis changes nothing above it.
 
-use testbed_core::{JobId, JobState};
+pub mod job;
+pub mod scheduler;
+pub mod store;
 
-/// Placeholder so the crate has a compiled surface; replaced in Phase 4.
-pub fn new_job() -> (JobId, JobState) {
-    (JobId::new(), JobState::Scheduled)
-}
+pub use job::Job;
+pub use scheduler::{Scheduler, TICK};
+pub use store::{JobStore, MemoryStore, StoreError};

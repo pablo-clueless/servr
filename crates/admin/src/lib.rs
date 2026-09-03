@@ -56,6 +56,169 @@ pub fn router(state: Shared) -> Router {
         .with_state(state)
 }
 
+/// Run lifecycle. Separate from [`router`] because it is the only part of the
+/// control plane that reaches the data plane — to create and drop schemas — and
+/// keeping that dependency off the main admin state makes the boundary visible.
+///
+/// This does not violate invariant 3. The control plane stores nothing in
+/// Postgres; it issues DDL on request and keeps its own state in memory, so a
+/// full data-plane wipe still leaves the testbed configured.
+pub fn runs_router(data: testbed_http::data::MaybeData) -> Router {
+    Router::new()
+        .route("/_admin/runs", get(list_runs).post(create_run))
+        .route("/_admin/runs/{id}", axum::routing::delete(drop_run))
+        .with_state(data)
+}
+
+/// Phase 3 gate: `{"run":"<uuid>"}`.
+async fn create_run(
+    State(data): State<testbed_http::data::MaybeData>,
+) -> Result<Json<Value>, RunError> {
+    let plane = testbed_http::data::require(&data)?;
+    let run = testbed_core::RunId::new();
+    plane.create_run(run).await?;
+
+    Ok(Json(
+        json!({ "run": run.to_string(), "schema": run.schema() }),
+    ))
+}
+
+async fn list_runs(
+    State(data): State<testbed_http::data::MaybeData>,
+) -> Result<Json<Value>, RunError> {
+    let plane = testbed_http::data::require(&data)?;
+    let runs: Vec<String> = plane.runs().await.iter().map(|r| r.to_string()).collect();
+    Ok(Json(json!({ "runs": runs })))
+}
+
+/// Drops the run's schema and everything in it. The control plane is untouched
+/// — this is the wipe that control-plane state has to survive (invariant 3).
+async fn drop_run(
+    State(data): State<testbed_http::data::MaybeData>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, RunError> {
+    let plane = testbed_http::data::require(&data)?;
+    let run: testbed_core::RunId = id.parse().map_err(|_| RunError::BadId(id.clone()))?;
+    plane.drop_run(run).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RunError {
+    #[error("{0:?} is not a run id")]
+    BadId(String),
+    #[error(transparent)]
+    Data(#[from] testbed_http::data::DataError),
+}
+
+impl axum::response::IntoResponse for RunError {
+    fn into_response(self) -> axum::response::Response {
+        use testbed_http::data::DataError;
+
+        let status = match &self {
+            Self::BadId(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::Data(DataError::Unconfigured) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::Data(DataError::UnknownRun(_)) => axum::http::StatusCode::NOT_FOUND,
+            Self::Data(DataError::Sql(_)) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+/// Job inspection and enqueueing.
+pub fn jobs_router(scheduler: Arc<testbed_queue::Scheduler>, state: Shared) -> Router {
+    Router::new()
+        .route("/_admin/jobs", get(list_jobs).post(enqueue_job))
+        .route("/_admin/jobs/{id}", get(get_job))
+        .with_state((scheduler, state))
+}
+
+#[derive(Deserialize)]
+struct NewJob {
+    kind: String,
+    /// Delay in **virtual** milliseconds. The Phase 4 gate enqueues 30_000 and
+    /// then advances the clock rather than waiting.
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    payload: Option<Value>,
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    backoff_ms: Option<Vec<u64>>,
+}
+
+/// Phase 4 gate: `{"id":"<uuid>"}`.
+async fn enqueue_job(
+    State((scheduler, state)): State<(Arc<testbed_queue::Scheduler>, Shared)>,
+    Json(body): Json<NewJob>,
+) -> Result<Json<Value>, JobError> {
+    let due_at = state.clock().now() + chrono::TimeDelta::milliseconds(body.delay_ms as i64);
+
+    let mut job = testbed_queue::Job::new(state.run(), body.kind, due_at);
+    if let Some(payload) = body.payload {
+        job = job.with_payload(payload);
+    }
+    if let Some(max) = body.max_attempts {
+        job = job.with_max_attempts(max);
+    }
+    if let Some(backoff) = body.backoff_ms {
+        job = job.with_backoff(backoff);
+    }
+
+    // T10: the enqueue trace is recorded so the execution span can *link* to
+    // it later rather than descend from it.
+    if let Some((trace, span)) = testbed_telemetry::propagation::current_ids() {
+        job = job.with_trace(trace, span);
+    }
+
+    let id = job.id;
+    scheduler.store().put(job).map_err(JobError::Store)?;
+
+    Ok(Json(json!({ "id": id.to_string(), "due_at": due_at })))
+}
+
+async fn get_job(
+    State((scheduler, _)): State<(Arc<testbed_queue::Scheduler>, Shared)>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, JobError> {
+    let uuid: uuid::Uuid = id.parse().map_err(|_| JobError::BadId(id.clone()))?;
+    let job = scheduler
+        .store()
+        .get(testbed_core::JobId(uuid))
+        .map_err(JobError::Store)?;
+
+    Ok(Json(serde_json::to_value(job).unwrap_or(Value::Null)))
+}
+
+async fn list_jobs(
+    State((scheduler, _)): State<(Arc<testbed_queue::Scheduler>, Shared)>,
+) -> Result<Json<Value>, JobError> {
+    let jobs = scheduler.store().list().map_err(JobError::Store)?;
+    Ok(Json(serde_json::to_value(jobs).unwrap_or(Value::Null)))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum JobError {
+    #[error("{0:?} is not a job id")]
+    BadId(String),
+    #[error(transparent)]
+    Store(testbed_queue::StoreError),
+}
+
+impl axum::response::IntoResponse for JobError {
+    fn into_response(self) -> axum::response::Response {
+        let status = match &self {
+            Self::BadId(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::Store(testbed_queue::StoreError::NotFound(_)) => {
+                axum::http::StatusCode::NOT_FOUND
+            }
+            Self::Store(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
 /// `/metrics`, mounted at the root rather than under `/_admin` because that is
 /// where every Prometheus scrape config looks by default.
 ///
