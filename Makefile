@@ -33,7 +33,7 @@ run:
 
 .PHONY: test
 test:
-	cargo test --workspace
+	cargo test --workspace --no-fail-fast
 
 .PHONY: fmt
 fmt:
@@ -71,3 +71,9 @@ gate-2b:
 	echo "expected:      4bf92f3577b34da6a3ce929d0e0e4736"; \
 	echo "testbed_ metrics:"; \
 	curl -s localhost:8080/metrics | grep -c '^testbed_'
+
+# Phase 3 gate. Needs Postgres; makes the isolation tests real rather than skipped.
+.PHONY: gate-3
+gate-3: up
+	DATABASE_URL=postgres://testbed:testbed@localhost:5432/testbed \
+	  cargo test -p testbed-server --test run_isolation -- --nocapture
