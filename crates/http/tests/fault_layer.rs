@@ -6,7 +6,7 @@
 //! the gate — only the real thing measures wall-clock latency over a socket.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -53,9 +53,10 @@ async fn the_gate_rule_returns_503_after_the_configured_latency() {
         ..Default::default()
     }]);
 
-    let started = Instant::now();
+    // Through the sanctioned accessor: invariant 1's gate greps test code too.
+    let started = testbed_telemetry::wall::instant();
     let response = get(&state, "/api/ping").await;
-    let elapsed = started.elapsed();
+    let elapsed = testbed_telemetry::wall::instant() - started;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(

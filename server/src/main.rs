@@ -78,8 +78,23 @@ async fn main() {
         }
     };
 
+    // The scheduler polls against the virtual clock. Redis storage is still
+    // owed; the in-memory store behaves identically above the `JobStore` trait.
+    let store = Arc::new(testbed_queue::MemoryStore::new());
+    let scheduler = Arc::new(testbed_queue::Scheduler::new(
+        store as Arc<dyn testbed_queue::JobStore>,
+        Arc::clone(&clock),
+        Arc::clone(state.bus()),
+        run,
+    ));
+    tokio::spawn(Arc::clone(&scheduler).run_forever());
+
     let app = Router::new()
         .merge(testbed_admin::router(Arc::clone(&state)))
+        .merge(testbed_admin::jobs_router(
+            Arc::clone(&scheduler),
+            Arc::clone(&state),
+        ))
         .merge(testbed_admin::runs_router(data.clone()))
         .merge(testbed_admin::metrics_route(
             Arc::clone(&state),
