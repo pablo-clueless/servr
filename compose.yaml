@@ -10,7 +10,11 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      # Host side is overridable. A developer with a native Postgres already
+      # listening on 5432 will otherwise have it silently shadow this one, and
+      # the symptom is "password authentication failed" against credentials
+      # that are demonstrably correct inside the container.
+      - "${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-testbed}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-testbed}
@@ -29,7 +33,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -43,8 +47,8 @@ services:
     image: axllent/mailpit:latest
     restart: unless-stopped
     ports:
-      - "1025:1025" # SMTP
-      - "8025:8025" # HTTP / REST
+      - "${MAILPIT_SMTP_PORT:-1025}:1025" # SMTP
+      - "${MAILPIT_HTTP_PORT:-8025}:8025" # HTTP / REST
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "1"
       MP_SMTP_AUTH_ALLOW_INSECURE: "1"
@@ -76,7 +80,7 @@ services:
         condition: service_started
 
   jaeger:
-    image: jaegertracing/all-in-one:1.62
+    image: jaegertracing/all-in-one:1.62.0
     profiles: ["obs"]
     restart: unless-stopped
     environment:
@@ -92,6 +96,12 @@ services:
       - ./deploy/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+    # The testbed runs on the host (or in the dev container), not in compose.
+    # On Linux `host.docker.internal` does not resolve without this mapping, so
+    # without it Prometheus silently scrapes nothing and `/metrics` looks empty
+    # for reasons that have nothing to do with the testbed.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   pgdata:
