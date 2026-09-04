@@ -16,9 +16,8 @@
 //!
 //! # Still owed
 //!
-//! `/_admin/runs` (Phase 3), `/_admin/jobs` (4), `/_admin/ws/*` (5),
-//! `/_admin/mail/send` (6), `/_admin/hooks/*` (7), `/_admin/telemetry/faults`
-//! (8), `/_admin/snapshot` (9).
+//! `/_admin/mail/send` (Phase 6), `/_admin/hooks/*` (7),
+//! `/_admin/telemetry/faults` (8), `/_admin/snapshot` (9).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -34,6 +33,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use testbed_core::FaultSpec;
+use testbed_http::json::Lenient;
 
 /// Mount point for everything in this crate.
 pub const PREFIX: &str = "/_admin";
@@ -125,6 +125,71 @@ impl axum::response::IntoResponse for RunError {
     }
 }
 
+/// WebSocket control: inject a frame, disconnect a topic, read presence.
+///
+/// These are how a test drives the ws surface from the outside — the point
+/// being that the client under test does nothing unusual, and the server-side
+/// events it has to cope with are triggered here.
+pub fn ws_router(hub: Arc<testbed_ws::Hub>) -> Router {
+    Router::new()
+        .route("/_admin/ws", get(ws_presence))
+        .route("/_admin/ws/publish", post(ws_publish))
+        .route("/_admin/ws/kill", post(ws_kill))
+        .with_state(hub)
+}
+
+#[derive(Deserialize)]
+struct Publish {
+    topic: String,
+    body: String,
+}
+
+/// Phase 5 gate: the subscriber on `topic` prints `body`.
+async fn ws_publish(
+    State(hub): State<Arc<testbed_ws::Hub>>,
+    Lenient(body): Lenient<Publish>,
+) -> Json<Value> {
+    // `None`: an admin publish has no originating connection, so it reaches
+    // every member including one that happens to be the test's own client.
+    let delivered = hub.publish(&body.topic, &body.body, None);
+    tracing::info!(topic = %body.topic, delivered, "admin publish");
+    Json(json!({ "ok": true, "delivered": delivered }))
+}
+
+#[derive(Deserialize)]
+struct Kill {
+    topic: String,
+    /// What the client sees in the close frame.
+    #[serde(default = "default_kill_reason")]
+    reason: String,
+}
+
+fn default_kill_reason() -> String {
+    "closed by testbed".to_string()
+}
+
+/// Phase 5 gate: the subscriber exits on a clean close, not a read timeout.
+///
+/// Trap T6 lives on the other side of this call — the hub queues an explicit
+/// Close frame rather than dropping the connection's channel, because a drop
+/// looks to the client like a network failure and silently invalidates exactly
+/// the reconnection tests this endpoint exists for.
+async fn ws_kill(
+    State(hub): State<Arc<testbed_ws::Hub>>,
+    Lenient(body): Lenient<Kill>,
+) -> Json<Value> {
+    let closed = hub.kill(&body.topic, &body.reason);
+    tracing::info!(topic = %body.topic, closed, "admin kill");
+    Json(json!({ "ok": true, "closed": closed }))
+}
+
+async fn ws_presence(State(hub): State<Arc<testbed_ws::Hub>>) -> Json<Value> {
+    Json(json!({
+        "connections": hub.connections(),
+        "topics": hub.presence(),
+    }))
+}
+
 /// Job inspection and enqueueing.
 pub fn jobs_router(scheduler: Arc<testbed_queue::Scheduler>, state: Shared) -> Router {
     Router::new()
@@ -151,7 +216,7 @@ struct NewJob {
 /// Phase 4 gate: `{"id":"<uuid>"}`.
 async fn enqueue_job(
     State((scheduler, state)): State<(Arc<testbed_queue::Scheduler>, Shared)>,
-    Json(body): Json<NewJob>,
+    Lenient(body): Lenient<NewJob>,
 ) -> Result<Json<Value>, JobError> {
     let due_at = state.clock().now() + chrono::TimeDelta::milliseconds(body.delay_ms as i64);
 
@@ -286,7 +351,7 @@ struct Advance {
 
 /// Moves virtual time forward. This must not sleep: the Phase 4 gate advances
 /// 30 seconds and asserts the call returns in milliseconds.
-async fn advance(State(state): State<Shared>, Json(body): Json<Advance>) -> Json<Value> {
+async fn advance(State(state): State<Shared>, Lenient(body): Lenient<Advance>) -> Json<Value> {
     let clock = state.clock();
     clock.advance(Duration::from_millis(body.ms));
     tracing::info!(advanced_ms = body.ms, now = %clock.now(), "clock advanced");
@@ -309,7 +374,7 @@ async fn list_faults(State(state): State<Shared>) -> Json<Vec<FaultSpec>> {
 
 /// Appends to the *effective* fault list, so posting a rule adds to whatever
 /// the scenario seeded rather than silently replacing it.
-async fn add_fault(State(state): State<Shared>, Json(spec): Json<FaultSpec>) -> Json<Value> {
+async fn add_fault(State(state): State<Shared>, Lenient(spec): Lenient<FaultSpec>) -> Json<Value> {
     let mut faults = state.resolved().faults.clone();
     tracing::info!(route = %spec.route, rate = spec.rate, "fault added");
     faults.push(spec);

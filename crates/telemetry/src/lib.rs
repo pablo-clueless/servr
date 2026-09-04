@@ -153,6 +153,55 @@ fn build_provider(run: testbed_core::RunId) -> Option<SdkTracerProvider> {
     }
 }
 
+/// Span links: "this happened after that", without "that" being its parent.
+///
+/// # Why linking and not parenting
+///
+/// Parenting is the intuitive choice and it is wrong wherever the two spans are
+/// separated by an arbitrary amount of time. A queue job delayed 30 minutes
+/// produces a 30-minute trace (trap T10); a WebSocket connection held open for
+/// the length of a test suite produces a trace as long as the suite. Once a few
+/// of those exist, every trace-waterfall UI pointed at the testbed becomes
+/// unusable — which is the opposite of what a telemetry source is for.
+///
+/// A link says the same thing without the cost: the new span is a trace root
+/// carrying a `FOLLOWS_FROM` reference back to the span that caused it. Jaeger
+/// renders it as a reference; the Phase 4 gate counts it.
+pub mod link {
+    use opentelemetry::trace::{SpanContext, TraceFlags, TraceState};
+    use testbed_core::{SpanId, TraceId};
+
+    /// Adds a `FOLLOWS_FROM` reference from `span` back to `(trace, parent)`.
+    ///
+    /// A no-op when either id is invalid, so a caller with no recorded context
+    /// — an unsampled trace, or a surface reached without one — degrades to an
+    /// unlinked root span rather than a link pointing at nothing.
+    pub fn follows_from(span: &tracing::Span, trace: TraceId, parent: SpanId) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+        if !trace.is_valid() || !parent.is_valid() {
+            return;
+        }
+
+        span.add_link(SpanContext::new(
+            opentelemetry::trace::TraceId::from_bytes(trace.to_bytes()),
+            opentelemetry::trace::SpanId::from_bytes(parent.to_bytes()),
+            TraceFlags::SAMPLED,
+            // Remote: the linked span was created outside this task's context.
+            true,
+            TraceState::default(),
+        ));
+    }
+
+    /// The same, for a caller holding an optional context — the common shape,
+    /// since a recorded trace context is always optional.
+    pub fn follows_from_opt(span: &tracing::Span, ids: Option<(TraceId, SpanId)>) {
+        if let Some((trace, parent)) = ids {
+            follows_from(span, trace, parent);
+        }
+    }
+}
+
 /// Attaching an attribute discovered *after* a span opens — a status code, a
 /// job outcome — requires declaring the field as `tracing::field::Empty` up
 /// front and `record()`-ing it later (trap T12). Forgetting this yields spans

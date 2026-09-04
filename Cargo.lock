@@ -2179,6 +2179,7 @@ dependencies = [
  "testbed-http",
  "testbed-queue",
  "testbed-telemetry",
+ "testbed-ws",
  "thiserror",
  "tokio",
  "tracing",
@@ -2291,6 +2292,7 @@ dependencies = [
  "testbed-telemetry",
  "testbed-ws",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http 0.7.0",
  "tracing",
@@ -2303,10 +2305,14 @@ name = "testbed-stream"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
+ "futures-util",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "testbed-core",
  "testbed-telemetry",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -2333,12 +2339,18 @@ name = "testbed-ws"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "testbed-core",
  "testbed-telemetry",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

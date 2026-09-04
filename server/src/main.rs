@@ -107,6 +107,13 @@ async fn main() {
     ));
     tokio::spawn(Arc::clone(&scheduler).run_forever());
 
+    let hub = Arc::new(testbed_ws::Hub::new(
+        Arc::clone(state.bus()),
+        Arc::clone(&clock),
+        run,
+    ));
+    let streams = testbed_stream::Streams::new(Arc::clone(state.bus()), Arc::clone(&clock), run);
+
     let app = Router::new()
         .merge(testbed_admin::router(Arc::clone(&state)))
         .merge(testbed_admin::jobs_router(
@@ -114,11 +121,24 @@ async fn main() {
             Arc::clone(&state),
         ))
         .merge(testbed_admin::runs_router(data.clone()))
+        .merge(testbed_admin::ws_router(Arc::clone(&hub)))
         .merge(testbed_admin::metrics_route(
             Arc::clone(&state),
             Arc::clone(&telemetry),
         ))
-        .merge(testbed_http::router_with_data(Arc::clone(&state), data));
+        .merge(testbed_http::router_with_data(Arc::clone(&state), data))
+        // ws and stream live in their own crates, so `http` cannot mount them
+        // (§4 forbids the cross-surface edge). They get the same fault layer
+        // through `guard` rather than a second copy of the wiring — a surface
+        // that quietly ends up unfaultable is what invariant 8 exists to stop.
+        .merge(testbed_http::fault::guard(
+            Arc::clone(&state),
+            testbed_ws::router(hub),
+        ))
+        .merge(testbed_http::fault::guard(
+            Arc::clone(&state),
+            testbed_stream::router(streams),
+        ));
 
     let port: u16 = std::env::var("TESTBED_PORT")
         .ok()
