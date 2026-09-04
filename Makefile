@@ -1,3 +1,11 @@
+# Local overrides live in .env (gitignored). Loading it here keeps the gates
+# working against whatever credentials and ports compose actually used, rather
+# than hardcoding values that silently drift from it.
+-include .env
+
+DATABASE_URL ?= postgres://testbed:testbed@localhost:5432/testbed
+REDIS_URL    ?= redis://localhost:6379
+
 .PHONY: help
 help:
 	@echo ""
@@ -29,7 +37,7 @@ down:
 
 .PHONY: run
 run:
-	cargo run -p testbed-server
+	DATABASE_URL="$(DATABASE_URL)" REDIS_URL="$(REDIS_URL)" cargo run -p testbed-server
 
 .PHONY: test
 test:
@@ -75,11 +83,26 @@ gate-2b:
 # Phase 3 gate. Needs Postgres; makes the isolation tests real rather than skipped.
 .PHONY: gate-3
 gate-3: up
-	DATABASE_URL=postgres://testbed:testbed@localhost:5432/testbed \
+	DATABASE_URL="$(DATABASE_URL)" \
 	  cargo test -p testbed-server --test run_isolation -- --nocapture
 
 # RedisStore against live Redis. Proves the Lua claim script (T3) actually runs.
 .PHONY: gate-redis
 gate-redis: up
-	REDIS_URL=redis://localhost:6379 \
+	REDIS_URL="$(REDIS_URL)" \
 	  cargo test -p testbed-queue --test redis_store -- --nocapture
+
+# Everything the dev container unblocks, in dependency order. Each is also
+# runnable on its own; this is the "prove the whole tree" pass.
+.PHONY: gates
+gates: up invariants
+	@echo "=== phase 0: infra healthy ==="
+	docker compose ps --format '{{.Service}} {{.Health}}'
+	@echo "=== phase 3: run isolation (needs postgres) ==="
+	DATABASE_URL="$(DATABASE_URL)" \
+	  cargo test -p testbed-server --test run_isolation -- --nocapture
+	@echo "=== redis store: the Lua claim script (T3) ==="
+	REDIS_URL="$(REDIS_URL)" \
+	  cargo test -p testbed-queue --test redis_store -- --nocapture
+	@echo
+	@echo "phase 2b still needs the obs profile: make up-obs && make gate-2b"

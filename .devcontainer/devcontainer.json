@@ -1,0 +1,73 @@
+{
+  "name": "testbed",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  // Docker *inside* the container, not the host's daemon.
+  //
+  // This is the load-bearing choice. Every gate in HANDOFF §7 curls `localhost`
+  // — `localhost:16686` for Jaeger, `localhost:8025` for Mailpit,
+  // `localhost:5432` for Postgres. Running the infra as sibling compose
+  // services would make those `jaeger:16686` and so on, and every gate would
+  // need rewriting. With docker-in-docker, `docker compose up -d` publishes to
+  // this container's own localhost and the gates run verbatim.
+  //
+  // The cost is `--privileged`, which the feature sets for us.
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true
+    }
+  },
+  "forwardPorts": [8080, 5432, 6379, 8025, 16686, 9090],
+  "portsAttributes": {
+    "8080": { "label": "testbed", "onAutoForward": "notify" },
+    "5432": { "label": "postgres", "onAutoForward": "silent" },
+    "6379": { "label": "redis", "onAutoForward": "silent" },
+    "8025": { "label": "mailpit UI", "onAutoForward": "silent" },
+    "16686": { "label": "jaeger UI", "onAutoForward": "silent" },
+    "9090": { "label": "prometheus", "onAutoForward": "silent" }
+  },
+  // Infra hostnames are `localhost` because of docker-in-docker, which is also
+  // what `env.example` and every gate assume.
+  "containerEnv": {
+    "DATABASE_URL": "postgres://testbed:testbed@localhost:5432/testbed",
+    "REDIS_URL": "redis://localhost:6379",
+    "MAILPIT_SMTP": "localhost:1025",
+    "MAILPIT_HTTP": "http://localhost:8025",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317",
+    "RUST_LOG": "info,testbed=debug",
+    "CARGO_TERM_COLOR": "always"
+  },
+  // Named volumes, not bind mounts: a Rust target/ directory on a bind mount
+  // across the Windows/Linux boundary is brutally slow and will make every
+  // `cargo test` feel broken.
+  "mounts": [
+    "source=testbed-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=testbed-cargo-registry,target=/usr/local/cargo/registry,type=volume"
+  ],
+  // The volumes above are created root-owned; hand them to the user who will
+  // actually build. Runs once at creation, before postStartCommand.
+  "onCreateCommand": "sudo chown -R vscode:vscode target /usr/local/cargo/registry",
+  // Brings the data plane up. A script rather than an inline command because
+  // it has to wait for the docker-in-docker daemon, which starts in parallel
+  // with this hook — see the comment in the script.
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.check.allTargets": true,
+        "editor.formatOnSave": true,
+        "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" }
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}
