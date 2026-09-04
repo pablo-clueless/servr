@@ -14,10 +14,11 @@ testbed-telemetry.workspace = true
 axum.workspace = true
 chrono.workspace = true
 opentelemetry.workspace = true
+redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 

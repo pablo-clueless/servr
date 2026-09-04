@@ -43,6 +43,7 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry_sdk-testing = { package = "opentelemetry_sdk", version = "0.32", features = ["testing"] }
 proptest = "1"
+redis = { version = "1.6", features = ["tokio-comp", "script", "connection-manager"] }
 rand = "0.9"
 socket2 = "0.6"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros"] }

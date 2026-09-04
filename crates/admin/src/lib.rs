@@ -173,7 +173,7 @@ async fn enqueue_job(
     }
 
     let id = job.id;
-    scheduler.store().put(job).map_err(JobError::Store)?;
+    scheduler.store().put(job).await.map_err(JobError::Store)?;
 
     Ok(Json(json!({ "id": id.to_string(), "due_at": due_at })))
 }
@@ -186,6 +186,7 @@ async fn get_job(
     let job = scheduler
         .store()
         .get(testbed_core::JobId(uuid))
+        .await
         .map_err(JobError::Store)?;
 
     Ok(Json(serde_json::to_value(job).unwrap_or(Value::Null)))
@@ -194,7 +195,7 @@ async fn get_job(
 async fn list_jobs(
     State((scheduler, _)): State<(Arc<testbed_queue::Scheduler>, Shared)>,
 ) -> Result<Json<Value>, JobError> {
-    let jobs = scheduler.store().list().map_err(JobError::Store)?;
+    let jobs = scheduler.store().list().await.map_err(JobError::Store)?;
     Ok(Json(serde_json::to_value(jobs).unwrap_or(Value::Null)))
 }
 
