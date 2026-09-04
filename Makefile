@@ -21,6 +21,7 @@ help:
 	@echo "  gate-0        Phase 0 gate: infra healthy + workspace builds"
 	@echo "  gate-5        Phase 5 gate: ws + streams, in-process"
 	@echo "  gate-6        Phase 6 gate: mail through Mailpit, run-isolated"
+	@echo "  gate-7        Phase 7 gate: webhooks, signing + virtual backoff"
 	@echo ""
 	@echo "  Jaeger  http://localhost:16686   Mailpit http://localhost:8025"
 	@echo "  Prom    http://localhost:9090    Admin   http://localhost:8080/_admin/health"
@@ -107,6 +108,14 @@ gate-5-live:
 	@echo "=== stream: openai-compatible chunks ==="
 	@curl -sN localhost:8080/v1/chat/completions -d '{"stream":true,"messages":[{"role":"user","content":"hi"}]}' | head -3
 
+# Phase 7 gate, in-process. Needs no infra: the sender delivers to the
+# testbed's own capture inbox over a real socket, which is what makes signing,
+# traceparent injection and capture testable in one pass.
+.PHONY: gate-7
+gate-7:
+	cargo test -p testbed-server --test webhook_gate -- --nocapture
+	cargo test -p testbed-hooks -- --nocapture
+
 # Phase 6 gate. Needs Mailpit; skips itself without MAILPIT_API rather than
 # failing, so it runs the moment infra is up.
 .PHONY: gate-6
@@ -136,5 +145,7 @@ gates: up invariants
 	@echo "=== phase 6: mail isolation (needs mailpit) ==="
 	MAILPIT_API="$(MAILPIT_API)" \
 	  cargo test -p testbed-mail --test mailpit -- --nocapture
+	@echo "=== phase 7: webhooks (needs no infra) ==="
+	$(MAKE) gate-7
 	@echo
 	@echo "phase 2b still needs the obs profile: make up-obs && make gate-2b"

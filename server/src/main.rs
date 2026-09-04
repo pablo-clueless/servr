@@ -142,6 +142,15 @@ async fn main() {
         }
     };
 
+    // Webhooks. The sender is a virtual-time poll loop of its own — see
+    // `testbed_hooks::outbound` for why it is not routed through the queue.
+    let hooks = Arc::new(testbed_hooks::Hooks::new(
+        Arc::clone(state.bus()),
+        Arc::clone(&clock),
+        run,
+    ));
+    tokio::spawn(Arc::clone(&hooks.sender).run_forever());
+
     let hub = Arc::new(testbed_ws::Hub::new(
         Arc::clone(state.bus()),
         Arc::clone(&clock),
@@ -158,6 +167,7 @@ async fn main() {
         .merge(testbed_admin::runs_router(data.clone()))
         .merge(testbed_admin::ws_router(Arc::clone(&hub)))
         .merge(testbed_admin::mail_router(mailer, Arc::clone(&state)))
+        .merge(testbed_admin::hooks_router(Arc::clone(&hooks)))
         .merge(testbed_admin::metrics_route(
             Arc::clone(&state),
             Arc::clone(&telemetry),
@@ -174,6 +184,12 @@ async fn main() {
         .merge(testbed_http::fault::guard(
             Arc::clone(&state),
             testbed_stream::router(streams),
+        ))
+        // The capture inbox is faulted too, deliberately: making the receiver
+        // flaky is how a sender's retry logic gets tested.
+        .merge(testbed_http::fault::guard(
+            Arc::clone(&state),
+            testbed_hooks::router(Arc::clone(&hooks.inbox)),
         ));
 
     let port: u16 = std::env::var("TESTBED_PORT")
