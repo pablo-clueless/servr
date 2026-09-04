@@ -193,22 +193,16 @@ impl Scheduler {
     }
 }
 
-/// Adds the `FOLLOWS_FROM` link the Phase 4 gate looks for.
+/// Adds the `FOLLOWS_FROM` link the Phase 4 gate looks for (trap T10).
+///
+/// The mechanics live in `telemetry` because the ws surface needs the same
+/// thing for the same reason — a frame span linking back to a long-lived
+/// connection span (invariant 10).
 fn link_to_enqueue(span: &tracing::Span, job: &Job) {
-    use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
-    use tracing_opentelemetry::OpenTelemetrySpanExt;
-
     let (Some(trace), Some(parent)) = (job.enqueued_trace, job.enqueued_span) else {
         return;
     };
-
-    span.add_link(SpanContext::new(
-        TraceId::from_bytes(trace.to_bytes()),
-        SpanId::from_bytes(parent.to_bytes()),
-        TraceFlags::SAMPLED,
-        true,
-        TraceState::default(),
-    ));
+    testbed_telemetry::link::follows_from(span, trace, parent);
 }
 
 #[cfg(test)]

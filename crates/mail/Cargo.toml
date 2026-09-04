@@ -12,7 +12,15 @@ testbed-core.workspace = true
 testbed-telemetry.workspace = true
 
 axum.workspace = true
+chrono.workspace = true
+lettre.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true

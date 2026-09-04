@@ -16,9 +16,8 @@
 //!
 //! # Still owed
 //!
-//! `/_admin/runs` (Phase 3), `/_admin/jobs` (4), `/_admin/ws/*` (5),
-//! `/_admin/mail/send` (6), `/_admin/hooks/*` (7), `/_admin/telemetry/faults`
-//! (8), `/_admin/snapshot` (9).
+//! `/_admin/hooks/*` (Phase 7), `/_admin/telemetry/faults` (8),
+//! `/_admin/snapshot` (9).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -34,6 +33,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use testbed_core::FaultSpec;
+use testbed_http::json::Lenient;
 
 /// Mount point for everything in this crate.
 pub const PREFIX: &str = "/_admin";
@@ -125,6 +125,196 @@ impl axum::response::IntoResponse for RunError {
     }
 }
 
+/// Mail: send through Mailpit's SMTP, read back through its REST API.
+///
+/// `None` when Mailpit was not reachable at boot, in which case these answer
+/// 503 — the same shape the data plane uses for Postgres.
+pub type MaybeMailer = Option<Arc<testbed_mail::Mailer>>;
+
+pub fn mail_router(mailer: MaybeMailer, state: Shared) -> Router {
+    Router::new()
+        .route("/_admin/mail", get(mail_list).delete(mail_purge))
+        .route("/_admin/mail/send", post(mail_send))
+        .with_state((mailer, state))
+}
+
+/// The run a mail request acts as, from `X-Testbed-Run`.
+///
+/// Falls back to the process run rather than rejecting, matching
+/// `testbed_http::items::Run` — single-run poking stays free of ceremony while
+/// a parallel harness always sends the header. The §7 gate sends it.
+fn run_of(
+    headers: &axum::http::HeaderMap,
+    state: &Shared,
+) -> Result<testbed_core::RunId, MailApiError> {
+    let Some(raw) = headers.get(testbed_core::RUN_HEADER) else {
+        return Ok(state.run());
+    };
+    raw.to_str()
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| MailApiError::BadRun(format!("{raw:?} is not a run id")))
+}
+
+/// Phase 6 gate: `POST /_admin/mail/send` with `x-testbed-run: $RUN_A`.
+async fn mail_send(
+    State((mailer, state)): State<(MaybeMailer, Shared)>,
+    headers: axum::http::HeaderMap,
+    Lenient(mail): Lenient<testbed_mail::OutgoingMail>,
+) -> Result<Json<Value>, MailApiError> {
+    let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
+    let run = run_of(&headers, &state)?;
+
+    let sent = mailer.send(run, mail).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": sent.message_id,
+        "to": sent.to,
+        "subject": sent.subject,
+        "run": run.to_string(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct MailQuery {
+    /// Passed to Mailpit's own search. A convenience for narrowing, never the
+    /// isolation mechanism — see trap T7.
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Read every run's mail rather than this one's. Off by default: the
+    /// run-filtered view is the one that holds invariant 7, and a caller has to
+    /// ask explicitly to leave it.
+    #[serde(default)]
+    all: bool,
+}
+
+/// The run-filtered inbox. This is the surface invariant 7 lives on.
+async fn mail_list(
+    State((mailer, state)): State<(MaybeMailer, Shared)>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<MailQuery>,
+) -> Result<Json<Value>, MailApiError> {
+    let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
+    let run = run_of(&headers, &state)?;
+    let limit = params.limit.unwrap_or(testbed_mail::inbox::DEFAULT_LIMIT);
+    let query = params.query.as_deref();
+
+    let messages = if params.all {
+        mailer.inbox().all(query, limit).await?
+    } else {
+        mailer.inbox().for_run(run, query, limit).await?
+    };
+
+    Ok(Json(json!({
+        "run": if params.all { Value::Null } else { json!(run.to_string()) },
+        "count": messages.len(),
+        "messages": messages,
+    })))
+}
+
+/// Deletes every message Mailpit holds, not just this run's.
+///
+/// Mailpit has no per-run delete for the same reason it has no per-run inbox
+/// (T7), so this is deliberately all-or-nothing rather than a filtered delete
+/// that would look per-run and not be.
+async fn mail_purge(
+    State((mailer, _)): State<(MaybeMailer, Shared)>,
+) -> Result<Json<Value>, MailApiError> {
+    let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
+    mailer.inbox().purge().await?;
+    Ok(Json(json!({ "ok": true, "scope": "all runs" })))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MailApiError {
+    #[error("Mailpit is not configured; set MAILPIT_SMTP and MAILPIT_API")]
+    Unconfigured,
+    #[error("{0}")]
+    BadRun(String),
+    #[error(transparent)]
+    Mail(#[from] testbed_mail::MailError),
+}
+
+impl axum::response::IntoResponse for MailApiError {
+    fn into_response(self) -> axum::response::Response {
+        let status = match &self {
+            Self::Unconfigured => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::BadRun(_) => axum::http::StatusCode::BAD_REQUEST,
+            // A send that fails because Mailpit went away is not the caller's
+            // fault, and 502 says so more usefully than 500.
+            Self::Mail(_) => axum::http::StatusCode::BAD_GATEWAY,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+/// WebSocket control: inject a frame, disconnect a topic, read presence.
+///
+/// These are how a test drives the ws surface from the outside — the point
+/// being that the client under test does nothing unusual, and the server-side
+/// events it has to cope with are triggered here.
+pub fn ws_router(hub: Arc<testbed_ws::Hub>) -> Router {
+    Router::new()
+        .route("/_admin/ws", get(ws_presence))
+        .route("/_admin/ws/publish", post(ws_publish))
+        .route("/_admin/ws/kill", post(ws_kill))
+        .with_state(hub)
+}
+
+#[derive(Deserialize)]
+struct Publish {
+    topic: String,
+    body: String,
+}
+
+/// Phase 5 gate: the subscriber on `topic` prints `body`.
+async fn ws_publish(
+    State(hub): State<Arc<testbed_ws::Hub>>,
+    Lenient(body): Lenient<Publish>,
+) -> Json<Value> {
+    // `None`: an admin publish has no originating connection, so it reaches
+    // every member including one that happens to be the test's own client.
+    let delivered = hub.publish(&body.topic, &body.body, None);
+    tracing::info!(topic = %body.topic, delivered, "admin publish");
+    Json(json!({ "ok": true, "delivered": delivered }))
+}
+
+#[derive(Deserialize)]
+struct Kill {
+    topic: String,
+    /// What the client sees in the close frame.
+    #[serde(default = "default_kill_reason")]
+    reason: String,
+}
+
+fn default_kill_reason() -> String {
+    "closed by testbed".to_string()
+}
+
+/// Phase 5 gate: the subscriber exits on a clean close, not a read timeout.
+///
+/// Trap T6 lives on the other side of this call — the hub queues an explicit
+/// Close frame rather than dropping the connection's channel, because a drop
+/// looks to the client like a network failure and silently invalidates exactly
+/// the reconnection tests this endpoint exists for.
+async fn ws_kill(
+    State(hub): State<Arc<testbed_ws::Hub>>,
+    Lenient(body): Lenient<Kill>,
+) -> Json<Value> {
+    let closed = hub.kill(&body.topic, &body.reason);
+    tracing::info!(topic = %body.topic, closed, "admin kill");
+    Json(json!({ "ok": true, "closed": closed }))
+}
+
+async fn ws_presence(State(hub): State<Arc<testbed_ws::Hub>>) -> Json<Value> {
+    Json(json!({
+        "connections": hub.connections(),
+        "topics": hub.presence(),
+    }))
+}
+
 /// Job inspection and enqueueing.
 pub fn jobs_router(scheduler: Arc<testbed_queue::Scheduler>, state: Shared) -> Router {
     Router::new()
@@ -151,7 +341,7 @@ struct NewJob {
 /// Phase 4 gate: `{"id":"<uuid>"}`.
 async fn enqueue_job(
     State((scheduler, state)): State<(Arc<testbed_queue::Scheduler>, Shared)>,
-    Json(body): Json<NewJob>,
+    Lenient(body): Lenient<NewJob>,
 ) -> Result<Json<Value>, JobError> {
     let due_at = state.clock().now() + chrono::TimeDelta::milliseconds(body.delay_ms as i64);
 
@@ -286,7 +476,7 @@ struct Advance {
 
 /// Moves virtual time forward. This must not sleep: the Phase 4 gate advances
 /// 30 seconds and asserts the call returns in milliseconds.
-async fn advance(State(state): State<Shared>, Json(body): Json<Advance>) -> Json<Value> {
+async fn advance(State(state): State<Shared>, Lenient(body): Lenient<Advance>) -> Json<Value> {
     let clock = state.clock();
     clock.advance(Duration::from_millis(body.ms));
     tracing::info!(advanced_ms = body.ms, now = %clock.now(), "clock advanced");
@@ -309,7 +499,7 @@ async fn list_faults(State(state): State<Shared>) -> Json<Vec<FaultSpec>> {
 
 /// Appends to the *effective* fault list, so posting a rule adds to whatever
 /// the scenario seeded rather than silently replacing it.
-async fn add_fault(State(state): State<Shared>, Json(spec): Json<FaultSpec>) -> Json<Value> {
+async fn add_fault(State(state): State<Shared>, Lenient(spec): Lenient<FaultSpec>) -> Json<Value> {
     let mut faults = state.resolved().faults.clone();
     tracing::info!(route = %spec.route, rate = spec.rate, "fault added");
     faults.push(spec);

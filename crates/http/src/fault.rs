@@ -84,6 +84,23 @@ impl Effects {
     }
 }
 
+/// Wraps `router` in the fault layer.
+///
+/// Exported because the ws and stream surfaces live in their own crates and
+/// `http` must not depend on them (HANDOFF §4). Without this, `server` would
+/// have to reach into the layer function and re-derive the wiring, and the two
+/// copies would drift — which is how a surface quietly ends up unfaultable, the
+/// exact failure invariant 8 exists to prevent.
+///
+/// # Truncation and unbounded bodies
+///
+/// A `truncate_body_at` fault buffers the whole body before cutting it, so a
+/// route wrapped here must not stream without end. Every current one is finite;
+/// `/_admin/events` is unbounded and is deliberately outside the layer anyway.
+pub fn guard(state: Arc<testbed_core::State>, router: axum::Router) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(state, layer))
+}
+
 /// Applies faults, then records the request on the event bus.
 ///
 /// The two belong together: this is the only place that knows which faults

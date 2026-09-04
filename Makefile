@@ -4,6 +4,7 @@
 -include .env
 
 DATABASE_URL ?= postgres://testbed:testbed@localhost:5432/testbed
+MAILPIT_API  ?= http://localhost:8025
 REDIS_URL    ?= redis://localhost:6379
 
 .PHONY: help
@@ -18,6 +19,8 @@ help:
 	@echo "  clippy        cargo clippy --workspace --all-targets -D warnings"
 	@echo "  invariants    Run the grep gates CI enforces"
 	@echo "  gate-0        Phase 0 gate: infra healthy + workspace builds"
+	@echo "  gate-5        Phase 5 gate: ws + streams, in-process"
+	@echo "  gate-6        Phase 6 gate: mail through Mailpit, run-isolated"
 	@echo ""
 	@echo "  Jaeger  http://localhost:16686   Mailpit http://localhost:8025"
 	@echo "  Prom    http://localhost:9090    Admin   http://localhost:8080/_admin/health"
@@ -86,6 +89,30 @@ gate-3: up
 	DATABASE_URL="$(DATABASE_URL)" \
 	  cargo test -p testbed-server --test run_isolation -- --nocapture
 
+# Phase 5 gate, in-process. Needs no infra: the ws half boots the assembled
+# router on an ephemeral port and drives it with a real WebSocket client (T6 is
+# only observable to one that inspects the close frame); the stream half
+# collects SSE bodies through the same router.
+.PHONY: gate-5
+gate-5:
+	cargo test -p testbed-server --test ws_gate --test stream_gate -- --nocapture
+	cargo test -p testbed-ws --test span_links -- --nocapture
+
+# The same gate as §7 writes it, against a server already running on :8080.
+# Needs websocat; the in-process `gate-5` is the one CI runs.
+.PHONY: gate-5-live
+gate-5-live:
+	@echo "=== ws: publish echoes, then kill closes cleanly (T6) ==="
+	@websocat -t "ws://localhost:8080/ws?topic=demo" & sleep 0.5; curl -s -X POST localhost:8080/_admin/ws/publish -d '{"topic":"demo","body":"hi"}'; echo; sleep 0.5; curl -s -X POST localhost:8080/_admin/ws/kill -d '{"topic":"demo"}'; echo; sleep 0.5
+	@echo "=== stream: openai-compatible chunks ==="
+	@curl -sN localhost:8080/v1/chat/completions -d '{"stream":true,"messages":[{"role":"user","content":"hi"}]}' | head -3
+
+# Phase 6 gate. Needs Mailpit; skips itself without MAILPIT_API rather than
+# failing, so it runs the moment infra is up.
+.PHONY: gate-6
+gate-6: up
+	MAILPIT_API="$(MAILPIT_API)" cargo test -p testbed-mail -- --nocapture
+
 # RedisStore against live Redis. Proves the Lua claim script (T3) actually runs.
 .PHONY: gate-redis
 gate-redis: up
@@ -104,5 +131,10 @@ gates: up invariants
 	@echo "=== redis store: the Lua claim script (T3) ==="
 	REDIS_URL="$(REDIS_URL)" \
 	  cargo test -p testbed-queue --test redis_store -- --nocapture
+	@echo "=== phase 5: ws + streams (needs no infra) ==="
+	$(MAKE) gate-5
+	@echo "=== phase 6: mail isolation (needs mailpit) ==="
+	MAILPIT_API="$(MAILPIT_API)" \
+	  cargo test -p testbed-mail --test mailpit -- --nocapture
 	@echo
 	@echo "phase 2b still needs the obs profile: make up-obs && make gate-2b"
