@@ -6,11 +6,11 @@
 pub mod data;
 pub mod fault;
 pub mod items;
+pub mod json;
 
 use std::sync::Arc;
 
 use axum::{
-    middleware,
     routing::{get, post},
     Json, Router,
 };
@@ -39,15 +39,13 @@ pub fn router_with_data(state: Arc<State>, data: MaybeData) -> Router {
         .route("/api/items/{id}", get(items::get).delete(items::delete))
         .with_state(items);
 
-    Router::new()
+    let plane = Router::new()
         .route("/api/ping", get(ping))
         .route("/api/echo", post(echo))
         .merge(api)
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            fault::layer,
-        ))
-        .with_state(state)
+        .with_state(Arc::clone(&state));
+
+    fault::guard(state, plane)
 }
 
 async fn ping() -> Json<Value> {
