@@ -35,6 +35,9 @@ arc-swap = "1.7"
 axum = { version = "0.8.9", features = ["ws", "macros"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-core = "0.3"
+# Webhook signing (Q4). All three are already in the lock via other crates.
+hex = "0.4"
+hmac = "0.12"
 futures-util = "0.3"
 # SMTP client only. Mailpit owns the server side (§2 decision 6) — nothing here
 # may grow into an embedded SMTP server. No TLS feature: Mailpit on localhost is
@@ -57,6 +60,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_urlencoded = "0.7"
+sha2 = "0.10"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.29"
