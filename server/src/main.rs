@@ -78,11 +78,29 @@ async fn main() {
         }
     };
 
-    // The scheduler polls against the virtual clock. Redis storage is still
-    // owed; the in-memory store behaves identically above the `JobStore` trait.
-    let store = Arc::new(testbed_queue::MemoryStore::new());
+    // The scheduler polls against the virtual clock either way; Redis only
+    // changes where jobs live, and whether they survive a restart.
+    let store: Arc<dyn testbed_queue::JobStore> = match std::env::var("REDIS_URL") {
+        Ok(url) => {
+            match testbed_queue::RedisStore::connect(&url, run).await {
+                Ok(store) => {
+                    tracing::info!("queue backed by Redis");
+                    Arc::new(store)
+                }
+                Err(e) => {
+                    tracing::warn!("Redis unreachable ({e}); queue is in-memory and will not survive a restart");
+                    Arc::new(testbed_queue::MemoryStore::new())
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!("REDIS_URL unset; queue is in-memory and will not survive a restart");
+            Arc::new(testbed_queue::MemoryStore::new())
+        }
+    };
+
     let scheduler = Arc::new(testbed_queue::Scheduler::new(
-        store as Arc<dyn testbed_queue::JobStore>,
+        store,
         Arc::clone(&clock),
         Arc::clone(state.bus()),
         run,
