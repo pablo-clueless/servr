@@ -77,3 +77,9 @@ gate-2b:
 gate-3: up
 	DATABASE_URL=postgres://testbed:testbed@localhost:5432/testbed \
 	  cargo test -p testbed-server --test run_isolation -- --nocapture
+
+# RedisStore against live Redis. Proves the Lua claim script (T3) actually runs.
+.PHONY: gate-redis
+gate-redis: up
+	REDIS_URL=redis://localhost:6379 \
+	  cargo test -p testbed-queue --test redis_store -- --nocapture
