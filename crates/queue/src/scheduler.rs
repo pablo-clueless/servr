@@ -84,17 +84,17 @@ impl Scheduler {
         tracing::info!(tick_ms = TICK.as_millis() as u64, "scheduler started");
         loop {
             ticker.tick().await;
-            self.tick();
+            self.tick().await;
         }
     }
 
     /// One pass. Separated from the loop so tests drive it directly instead of
     /// sleeping — a test that sleeps to observe the scheduler is testing the
     /// tick interval, not the scheduler.
-    pub fn tick(&self) {
+    pub async fn tick(&self) {
         let now = self.clock.now();
 
-        let due = match self.store.claim_due(now) {
+        let due = match self.store.claim_due(now).await {
             Ok(due) => due,
             Err(e) => {
                 tracing::error!("claiming due jobs failed: {e}");
@@ -103,11 +103,11 @@ impl Scheduler {
         };
 
         for job in due {
-            self.execute(job);
+            self.execute(job).await;
         }
     }
 
-    fn execute(&self, job: Job) {
+    async fn execute(&self, job: Job) {
         self.emit(&job, JobState::Scheduled, JobState::Running);
 
         // Trap T10: the execution span *links* to the enqueue span rather than
@@ -137,7 +137,7 @@ impl Scheduler {
                 span.record(testbed_telemetry::late::JOB_OUTCOME, "succeeded");
                 next.state = JobState::Succeeded;
                 next.last_error = None;
-                self.persist(&next);
+                self.persist(&next).await;
                 self.emit(&next, JobState::Running, JobState::Succeeded);
             }
             Err(error) => {
@@ -150,12 +150,12 @@ impl Scheduler {
                     let delay = next.next_backoff_ms();
                     next.state = JobState::Scheduled;
                     next.due_at = self.clock.now() + TimeDelta::milliseconds(delay as i64);
-                    self.persist(&next);
+                    self.persist(&next).await;
                     self.emit(&next, JobState::Running, JobState::Scheduled);
                     tracing::debug!(job = %next.id, attempt = next.attempt, delay_ms = delay, %error, "job retrying");
                 } else {
                     next.state = JobState::Dead;
-                    self.persist(&next);
+                    self.persist(&next).await;
                     self.emit(&next, JobState::Running, JobState::Dead);
                     tracing::warn!(job = %next.id, attempts = next.attempt, %error, "job dead-lettered");
                 }
@@ -163,8 +163,8 @@ impl Scheduler {
         }
     }
 
-    fn persist(&self, job: &Job) {
-        if let Err(e) = self.store.put(job.clone()) {
+    async fn persist(&self, job: &Job) {
+        if let Err(e) = self.store.put(job.clone()).await {
             tracing::error!(job = %job.id, "persisting job state failed: {e}");
         }
     }
@@ -253,17 +253,17 @@ mod tests {
     ///
     /// If this ever starts taking ~30s, the scheduler is reading wall time and
     /// Phase 4 has failed regardless of the state transition.
-    #[test]
-    fn advancing_the_clock_runs_a_delayed_job_immediately() {
+    #[tokio::test]
+    async fn advancing_the_clock_runs_a_delayed_job_immediately() {
         let h = harness();
 
         let job = Job::new(h.run, "noop", h.clock.now() + TimeDelta::seconds(30));
         let id = job.id;
-        h.store.put(job).unwrap();
+        h.store.put(job).await.unwrap();
 
-        h.scheduler.tick();
+        h.scheduler.tick().await;
         assert_eq!(
-            h.store.get(id).unwrap().state,
+            h.store.get(id).await.unwrap().state,
             JobState::Scheduled,
             "the job ran before it was due"
         );
@@ -274,10 +274,10 @@ mod tests {
         // does.
         let started = testbed_telemetry::wall::instant();
         h.clock.advance(Duration::from_secs(30));
-        h.scheduler.tick();
+        h.scheduler.tick().await;
         let elapsed = testbed_telemetry::wall::instant() - started;
 
-        assert_eq!(h.store.get(id).unwrap().state, JobState::Succeeded);
+        assert_eq!(h.store.get(id).await.unwrap().state, JobState::Succeeded);
         assert!(
             elapsed < Duration::from_millis(200),
             "30 virtual seconds cost {elapsed:?} of real time; the scheduler is \
@@ -285,39 +285,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failing_job_retries_on_the_configured_virtual_backoff() {
+    #[tokio::test]
+    async fn a_failing_job_retries_on_the_configured_virtual_backoff() {
         let h = harness();
 
         let job = Job::new(h.run, "fail", h.clock.now())
             .with_backoff(vec![1_000, 5_000])
             .with_max_attempts(3);
         let id = job.id;
-        h.store.put(job).unwrap();
+        h.store.put(job).await.unwrap();
 
         // Attempt 1 fails, retry due 1s later in virtual time.
-        h.scheduler.tick();
-        let after_first = h.store.get(id).unwrap();
+        h.scheduler.tick().await;
+        let after_first = h.store.get(id).await.unwrap();
         assert_eq!(after_first.state, JobState::Scheduled);
         assert_eq!(after_first.attempt, 1);
 
         // Not yet due: ticking changes nothing.
-        h.scheduler.tick();
-        assert_eq!(h.store.get(id).unwrap().attempt, 1);
+        h.scheduler.tick().await;
+        assert_eq!(h.store.get(id).await.unwrap().attempt, 1);
 
         h.clock.advance(Duration::from_millis(1_000));
-        h.scheduler.tick();
-        assert_eq!(h.store.get(id).unwrap().attempt, 2);
+        h.scheduler.tick().await;
+        assert_eq!(h.store.get(id).await.unwrap().attempt, 2);
 
         // Second backoff is longer; 1s is not enough.
         h.clock.advance(Duration::from_millis(1_000));
-        h.scheduler.tick();
-        assert_eq!(h.store.get(id).unwrap().attempt, 2);
+        h.scheduler.tick().await;
+        assert_eq!(h.store.get(id).await.unwrap().attempt, 2);
 
         h.clock.advance(Duration::from_millis(4_000));
-        h.scheduler.tick();
+        h.scheduler.tick().await;
 
-        let final_state = h.store.get(id).unwrap();
+        let final_state = h.store.get(id).await.unwrap();
         assert_eq!(final_state.attempt, 3);
         assert_eq!(
             final_state.state,
@@ -326,42 +326,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_dead_job_stays_dead() {
+    #[tokio::test]
+    async fn a_dead_job_stays_dead() {
         let h = harness();
 
         let job = Job::new(h.run, "fail", h.clock.now())
             .with_backoff(vec![0])
             .with_max_attempts(1);
         let id = job.id;
-        h.store.put(job).unwrap();
+        h.store.put(job).await.unwrap();
 
-        h.scheduler.tick();
-        assert_eq!(h.store.get(id).unwrap().state, JobState::Dead);
+        h.scheduler.tick().await;
+        assert_eq!(h.store.get(id).await.unwrap().state, JobState::Dead);
 
         // A terminal job is never claimed again, however far the clock moves.
         h.clock.advance(Duration::from_secs(3600));
-        h.scheduler.tick();
-        assert_eq!(h.store.get(id).unwrap().attempt, 1);
+        h.scheduler.tick().await;
+        assert_eq!(h.store.get(id).await.unwrap().attempt, 1);
     }
 
-    #[test]
-    fn an_unknown_kind_fails_rather_than_disappearing() {
+    #[tokio::test]
+    async fn an_unknown_kind_fails_rather_than_disappearing() {
         let h = harness();
 
         let job = Job::new(h.run, "does-not-exist", h.clock.now()).with_max_attempts(1);
         let id = job.id;
-        h.store.put(job).unwrap();
+        h.store.put(job).await.unwrap();
 
-        h.scheduler.tick();
+        h.scheduler.tick().await;
 
-        let done = h.store.get(id).unwrap();
+        let done = h.store.get(id).await.unwrap();
         assert_eq!(done.state, JobState::Dead);
         assert!(done.last_error.unwrap().contains("no handler"));
     }
 
-    #[test]
-    fn a_succeeding_job_runs_exactly_once() {
+    #[tokio::test]
+    async fn a_succeeding_job_runs_exactly_once() {
         let h = harness();
         let runs = Arc::new(AtomicU32::new(0));
 
@@ -379,16 +379,17 @@ mod tests {
 
         h.store
             .put(Job::new(h.run, "count", h.clock.now()))
+            .await
             .unwrap();
 
         for _ in 0..5 {
-            scheduler.tick();
+            scheduler.tick().await;
         }
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn every_transition_reaches_the_event_bus() {
+    #[tokio::test]
+    async fn every_transition_reaches_the_event_bus() {
         use futures_util::StreamExt;
 
         let run = RunId::new();
@@ -402,30 +403,27 @@ mod tests {
             run,
         );
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut events = bus.subscribe();
+        let mut events = bus.subscribe();
 
-            store.put(Job::new(run, "noop", clock.now())).unwrap();
-            scheduler.tick();
+        store.put(Job::new(run, "noop", clock.now())).await.unwrap();
+        scheduler.tick().await;
 
-            let mut transitions = Vec::new();
-            while let Ok(Some(event)) =
-                tokio::time::timeout(Duration::from_millis(50), events.next()).await
-            {
-                if let EventKind::JobTransition { from, to, .. } = event.kind {
-                    transitions.push((from, to));
-                }
+        let mut transitions = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(50), events.next()).await
+        {
+            if let EventKind::JobTransition { from, to, .. } = event.kind {
+                transitions.push((from, to));
             }
+        }
 
-            assert_eq!(
-                transitions,
-                vec![
-                    (JobState::Scheduled, JobState::Running),
-                    (JobState::Running, JobState::Succeeded),
-                ],
-                "a state change happened without reaching the bus (invariant 4)"
-            );
-        });
+        assert_eq!(
+            transitions,
+            vec![
+                (JobState::Scheduled, JobState::Running),
+                (JobState::Running, JobState::Succeeded),
+            ],
+            "a state change happened without reaching the bus (invariant 4)"
+        );
     }
 }

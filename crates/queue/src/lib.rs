@@ -6,17 +6,16 @@
 //! times against the virtual clock ([`scheduler`]); Redis only holds jobs and
 //! hands back the ones that are due ([`store`]).
 //!
-//! # Still owed
-//!
-//! The Redis [`store::JobStore`] implementation, with the Lua script that makes
-//! `claim_due` atomic (T3). [`store::MemoryStore`] is the working
-//! implementation today and is what the Phase 4 timing gate runs against; the
-//! trait exists so swapping in Redis changes nothing above it.
+//! Two [`store::JobStore`] implementations: [`store::MemoryStore`] for
+//! single-process use and tests, and [`redis_store::RedisStore`] for state that
+//! survives a restart. Everything above the trait is identical either way.
 
 pub mod job;
+pub mod redis_store;
 pub mod scheduler;
 pub mod store;
 
 pub use job::Job;
+pub use redis_store::RedisStore;
 pub use scheduler::{Scheduler, TICK};
 pub use store::{JobStore, MemoryStore, StoreError};
