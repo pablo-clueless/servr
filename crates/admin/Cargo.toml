@@ -11,7 +11,9 @@ license.workspace = true
 testbed-core.workspace = true
 testbed-telemetry.workspace = true
 testbed-http.workspace = true
+testbed-mail.workspace = true
 testbed-queue.workspace = true
+testbed-ws.workspace = true
 
 axum.workspace = true
 chrono.workspace = true

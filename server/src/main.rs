@@ -107,6 +107,48 @@ async fn main() {
     ));
     tokio::spawn(Arc::clone(&scheduler).run_forever());
 
+    // Mailpit, like Postgres and Redis, is optional: without it `/_admin/mail/*`
+    // answers 503 and every other surface is unaffected. The probe is a real
+    // request rather than a lazy transport, because lettre would happily accept
+    // sends into a void and the first sign of trouble would be an empty inbox —
+    // which is indistinguishable from working isolation (T7).
+    let mailer = {
+        let config = testbed_mail::MailConfig::from_env();
+        match testbed_mail::Mailer::new(
+            config.clone(),
+            Arc::clone(state.bus()),
+            Arc::clone(&clock),
+            run,
+        ) {
+            Ok(mailer) => match mailer.probe().await {
+                Ok(version) => {
+                    tracing::info!(smtp = %config.smtp, api = %config.api, %version, "mailpit ready");
+                    Some(Arc::new(mailer))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Mailpit unreachable at {} ({e}); /_admin/mail will answer 503",
+                        config.api
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "mail client could not be built ({e}); /_admin/mail will answer 503"
+                );
+                None
+            }
+        }
+    };
+
+    let hub = Arc::new(testbed_ws::Hub::new(
+        Arc::clone(state.bus()),
+        Arc::clone(&clock),
+        run,
+    ));
+    let streams = testbed_stream::Streams::new(Arc::clone(state.bus()), Arc::clone(&clock), run);
+
     let app = Router::new()
         .merge(testbed_admin::router(Arc::clone(&state)))
         .merge(testbed_admin::jobs_router(
@@ -114,11 +156,25 @@ async fn main() {
             Arc::clone(&state),
         ))
         .merge(testbed_admin::runs_router(data.clone()))
+        .merge(testbed_admin::ws_router(Arc::clone(&hub)))
+        .merge(testbed_admin::mail_router(mailer, Arc::clone(&state)))
         .merge(testbed_admin::metrics_route(
             Arc::clone(&state),
             Arc::clone(&telemetry),
         ))
-        .merge(testbed_http::router_with_data(Arc::clone(&state), data));
+        .merge(testbed_http::router_with_data(Arc::clone(&state), data))
+        // ws and stream live in their own crates, so `http` cannot mount them
+        // (§4 forbids the cross-surface edge). They get the same fault layer
+        // through `guard` rather than a second copy of the wiring — a surface
+        // that quietly ends up unfaultable is what invariant 8 exists to stop.
+        .merge(testbed_http::fault::guard(
+            Arc::clone(&state),
+            testbed_ws::router(hub),
+        ))
+        .merge(testbed_http::fault::guard(
+            Arc::clone(&state),
+            testbed_stream::router(streams),
+        ));
 
     let port: u16 = std::env::var("TESTBED_PORT")
         .ok()
