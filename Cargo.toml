@@ -36,6 +36,10 @@ axum = { version = "0.8.9", features = ["ws", "macros"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-core = "0.3"
 futures-util = "0.3"
+# SMTP client only. Mailpit owns the server side (§2 decision 6) — nothing here
+# may grow into an embedded SMTP server. No TLS feature: Mailpit on localhost is
+# plaintext, and the testbed never speaks SMTP to anything else.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 opentelemetry = "0.32"
@@ -43,6 +47,9 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry_sdk-testing = { package = "opentelemetry_sdk", version = "0.32", features = ["testing"] }
 proptest = "1"
+# Already compiled in via opentelemetry-http, so this costs no new tree. Reads
+# Mailpit's REST API now; Phase 7 sends outbound webhooks through it.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 redis = { version = "1.6", features = ["tokio-comp", "script", "connection-manager"] }
 rand = "0.9"
 socket2 = "0.6"
