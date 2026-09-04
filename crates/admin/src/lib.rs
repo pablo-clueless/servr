@@ -16,8 +16,8 @@
 //!
 //! # Still owed
 //!
-//! `/_admin/mail/send` (Phase 6), `/_admin/hooks/*` (7),
-//! `/_admin/telemetry/faults` (8), `/_admin/snapshot` (9).
+//! `/_admin/hooks/*` (Phase 7), `/_admin/telemetry/faults` (8),
+//! `/_admin/snapshot` (9).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -120,6 +120,131 @@ impl axum::response::IntoResponse for RunError {
             Self::Data(DataError::Unconfigured) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Self::Data(DataError::UnknownRun(_)) => axum::http::StatusCode::NOT_FOUND,
             Self::Data(DataError::Sql(_)) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+/// Mail: send through Mailpit's SMTP, read back through its REST API.
+///
+/// `None` when Mailpit was not reachable at boot, in which case these answer
+/// 503 — the same shape the data plane uses for Postgres.
+pub type MaybeMailer = Option<Arc<testbed_mail::Mailer>>;
+
+pub fn mail_router(mailer: MaybeMailer, state: Shared) -> Router {
+    Router::new()
+        .route("/_admin/mail", get(mail_list).delete(mail_purge))
+        .route("/_admin/mail/send", post(mail_send))
+        .with_state((mailer, state))
+}
+
+/// The run a mail request acts as, from `X-Testbed-Run`.
+///
+/// Falls back to the process run rather than rejecting, matching
+/// `testbed_http::items::Run` — single-run poking stays free of ceremony while
+/// a parallel harness always sends the header. The §7 gate sends it.
+fn run_of(
+    headers: &axum::http::HeaderMap,
+    state: &Shared,
+) -> Result<testbed_core::RunId, MailApiError> {
+    let Some(raw) = headers.get(testbed_core::RUN_HEADER) else {
+        return Ok(state.run());
+    };
+    raw.to_str()
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| MailApiError::BadRun(format!("{raw:?} is not a run id")))
+}
+
+/// Phase 6 gate: `POST /_admin/mail/send` with `x-testbed-run: $RUN_A`.
+async fn mail_send(
+    State((mailer, state)): State<(MaybeMailer, Shared)>,
+    headers: axum::http::HeaderMap,
+    Lenient(mail): Lenient<testbed_mail::OutgoingMail>,
+) -> Result<Json<Value>, MailApiError> {
+    let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
+    let run = run_of(&headers, &state)?;
+
+    let sent = mailer.send(run, mail).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "message_id": sent.message_id,
+        "to": sent.to,
+        "subject": sent.subject,
+        "run": run.to_string(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct MailQuery {
+    /// Passed to Mailpit's own search. A convenience for narrowing, never the
+    /// isolation mechanism — see trap T7.
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Read every run's mail rather than this one's. Off by default: the
+    /// run-filtered view is the one that holds invariant 7, and a caller has to
+    /// ask explicitly to leave it.
+    #[serde(default)]
+    all: bool,
+}
+
+/// The run-filtered inbox. This is the surface invariant 7 lives on.
+async fn mail_list(
+    State((mailer, state)): State<(MaybeMailer, Shared)>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<MailQuery>,
+) -> Result<Json<Value>, MailApiError> {
+    let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
+    let run = run_of(&headers, &state)?;
+    let limit = params.limit.unwrap_or(testbed_mail::inbox::DEFAULT_LIMIT);
+    let query = params.query.as_deref();
+
+    let messages = if params.all {
+        mailer.inbox().all(query, limit).await?
+    } else {
+        mailer.inbox().for_run(run, query, limit).await?
+    };
+
+    Ok(Json(json!({
+        "run": if params.all { Value::Null } else { json!(run.to_string()) },
+        "count": messages.len(),
+        "messages": messages,
+    })))
+}
+
+/// Deletes every message Mailpit holds, not just this run's.
+///
+/// Mailpit has no per-run delete for the same reason it has no per-run inbox
+/// (T7), so this is deliberately all-or-nothing rather than a filtered delete
+/// that would look per-run and not be.
+async fn mail_purge(
+    State((mailer, _)): State<(MaybeMailer, Shared)>,
+) -> Result<Json<Value>, MailApiError> {
+    let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
+    mailer.inbox().purge().await?;
+    Ok(Json(json!({ "ok": true, "scope": "all runs" })))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MailApiError {
+    #[error("Mailpit is not configured; set MAILPIT_SMTP and MAILPIT_API")]
+    Unconfigured,
+    #[error("{0}")]
+    BadRun(String),
+    #[error(transparent)]
+    Mail(#[from] testbed_mail::MailError),
+}
+
+impl axum::response::IntoResponse for MailApiError {
+    fn into_response(self) -> axum::response::Response {
+        let status = match &self {
+            Self::Unconfigured => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Self::BadRun(_) => axum::http::StatusCode::BAD_REQUEST,
+            // A send that fails because Mailpit went away is not the caller's
+            // fault, and 502 says so more usefully than 500.
+            Self::Mail(_) => axum::http::StatusCode::BAD_GATEWAY,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
