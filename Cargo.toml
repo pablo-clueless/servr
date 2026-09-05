@@ -58,10 +58,20 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # two bindings distinct keeps that gate precise. `bundled` so no system SQLite
 # is required.
 rusqlite = { version = "0.37", features = ["bundled"] }
-redis = { version = "1.6", features = ["tokio-comp", "script", "connection-manager"] }
+# `tokio-rustls-comp` + webpki roots so `rediss://` works. Every managed Redis
+# (Render Key Value, Upstash, ElastiCache in transit-encryption mode) requires
+# TLS on its external endpoint; without this a `rediss://` URL fails to connect
+# and a `redis://` one is refused outright.
+redis = { version = "1.6", features = ["tokio-comp", "script", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 rand = "0.9"
 socket2 = "0.6"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros"] }
+# `tls-rustls` is not optional in practice: every managed Postgres (Render,
+# Neon, Supabase, RDS) requires TLS, and without the feature sqlx fails with
+# "TLS upgrade required by connect options but SQLx was built without TLS
+# support enabled" — which reads as a network problem, not a build one.
+# rustls with webpki roots rather than native-tls: no system OpenSSL, and no
+# dependency on ca-certificates being present in a slim image.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros", "tls-rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_urlencoded = "0.7"
