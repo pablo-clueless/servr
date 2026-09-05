@@ -18,23 +18,78 @@ const BUS_CAPACITY: usize = 1024;
 #[tokio::main]
 async fn main() {
     let run = RunId::new();
-    let telemetry = Arc::new(testbed_telemetry::init(run));
 
-    let scenario_path =
-        std::env::var("TESTBED_SCENARIO").unwrap_or_else(|_| "scenarios/default.toml".to_string());
-    let scenario = match Scenario::from_path(&scenario_path) {
-        Ok(scenario) => scenario,
-        Err(e) => {
-            // Booting with a silently empty scenario would make every later
-            // assertion meaningless, so this is fatal.
-            tracing::error!("{e}");
-            std::process::exit(1);
+    // Order matters: the exporter shim reads its faults from `State`, so the
+    // control plane has to exist before telemetry is installed. That puts both
+    // branches below ahead of the subscriber, which is why their failures are
+    // `eprintln!` — there is nothing to log through yet, and a fatal boot error
+    // has to be visible regardless.
+    //
+    // `--restore <path>` boots from a snapshot instead of a scenario file
+    // (HANDOFF §7 phase 9). Restoring at boot rather than through the admin API
+    // is deliberate: swapping the control plane under a running server would
+    // leave in-flight requests, queued jobs and open connections pointing at a
+    // run that no longer matches.
+    let restore = restore_path();
+
+    let (run, clock, state) = match &restore {
+        Some(path) => {
+            let snapshot = match testbed_core::Snapshot::read(path) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let run = snapshot.run;
+            let clock = Arc::new(snapshot.restore_clock());
+            let bus = Arc::new(BroadcastBus::new(BUS_CAPACITY, Arc::clone(&clock), run));
+            let state = Arc::new(State::new(
+                snapshot.base.clone(),
+                Arc::clone(&clock),
+                bus,
+                run,
+            ));
+            // The overlay is applied after construction so `base` stays exactly
+            // what the snapshot recorded — `reset` has to land back there
+            // (invariant 2), not on the overlay that was live at capture.
+            state.mutate(|overlay| *overlay = snapshot.overlay.clone());
+            (run, clock, state)
+        }
+        None => {
+            let scenario_path = std::env::var("TESTBED_SCENARIO")
+                .unwrap_or_else(|_| "scenarios/default.toml".to_string());
+            let scenario = match Scenario::from_path(&scenario_path) {
+                Ok(scenario) => scenario,
+                Err(e) => {
+                    // Booting with a silently empty scenario would make every
+                    // later assertion meaningless, so this is fatal.
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let clock = Arc::new(Clock::new());
+            let bus = Arc::new(BroadcastBus::new(BUS_CAPACITY, Arc::clone(&clock), run));
+            let state = Arc::new(State::new(scenario, Arc::clone(&clock), bus, run));
+            (run, clock, state)
         }
     };
 
-    let clock = Arc::new(Clock::new());
-    let bus = Arc::new(BroadcastBus::new(BUS_CAPACITY, Arc::clone(&clock), run));
-    let state = Arc::new(State::new(scenario, Arc::clone(&clock), bus, run));
+    let telemetry = Arc::new(testbed_telemetry::init(
+        run,
+        Arc::new(testbed_telemetry::chaos::FromState(Arc::clone(&state))),
+    ));
+
+    if let Some(path) = &restore {
+        tracing::info!(
+            %path,
+            run = %run,
+            clock_offset_ms = clock.offset_ms(),
+            "restored control plane from snapshot; the data plane was not restored"
+        );
+    }
 
     tracing::info!(
         run = %run,
@@ -52,6 +107,16 @@ async fn main() {
     }
     if let Some(blast) = &state.base().blast_radius {
         tracing::warn!(blast_radius = %blast, "scenario blast radius");
+    }
+    // A scenario that seeds telemetry corruption has to say so at boot, or the
+    // first person to look at the collector spends the afternoon debugging the
+    // testbed instead of using it.
+    let seeded = &state.base().telemetry;
+    if seeded.rate > 0.0 {
+        tracing::warn!(
+            rate = seeded.rate,
+            "scenario seeds telemetry faults; exported telemetry is deliberately wrong"
+        );
     }
 
     // The data plane is optional. Without Postgres the HTTP, telemetry and
@@ -192,7 +257,11 @@ async fn main() {
             testbed_hooks::router(Arc::clone(&hooks.inbox)),
         ));
 
+    // `PORT` is the fallback because that is what every managed host injects
+    // (Render, Fly, Heroku); `TESTBED_PORT` still wins so a local gate can move
+    // the server off 8080 without competing with whatever set `PORT`.
     let port: u16 = std::env::var("TESTBED_PORT")
+        .or_else(|_| std::env::var("PORT"))
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
@@ -214,6 +283,42 @@ async fn main() {
     // Trap T11: flush the last span batch, or it takes the spans from whatever
     // you were investigating down with it.
     telemetry.shutdown();
+}
+
+/// `--restore <path>`, if given.
+///
+/// Hand-rolled rather than pulling in an argument parser: the binary has
+/// exactly one flag, and every other knob is an environment variable so that
+/// `compose.yaml` and the gates can set it without a shell.
+fn restore_path() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    let arg = args.next()?;
+
+    let path = match arg.as_str() {
+        "--restore" => args.next().unwrap_or_else(|| {
+            eprintln!("error: --restore needs a path");
+            std::process::exit(1);
+        }),
+        other => match other.strip_prefix("--restore=") {
+            Some(path) => path.to_string(),
+            None => {
+                eprintln!(
+                    "error: unknown argument {other:?} (only --restore <path> is understood)"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
+
+    // Rejected rather than ignored: a mistyped second flag that silently did
+    // nothing would be found only by noticing the testbed behaving as though it
+    // had never been passed.
+    if let Some(extra) = args.next() {
+        eprintln!("error: unexpected argument {extra:?}");
+        std::process::exit(1);
+    }
+
+    Some(path)
 }
 
 /// Binds dual-stack, so `localhost` reaches the server over either family.

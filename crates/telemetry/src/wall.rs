@@ -30,6 +30,17 @@ pub fn instant() -> Instant {
     Instant::now()
 }
 
+/// Real time as a [`SystemTime`], which is what `SpanData` timestamps are.
+///
+/// Exists so nothing outside this file has to spell `SystemTime::now()` — the
+/// grep in invariant 1 does not care *why* a file reads a wall clock, and a
+/// legitimate need in the exporter shim would otherwise have to either fail the
+/// gate or weaken it with another exemption. Same rule as the rest of this
+/// module: never call it from anything that decides *when* something happens.
+pub fn system_now() -> SystemTime {
+    SystemTime::now()
+}
+
 /// Span attribute names. Every span carries both (HANDOFF §7 phase 2b).
 pub mod attr {
     pub const RUN_ID: &str = "testbed.run_id";

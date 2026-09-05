@@ -11,22 +11,25 @@
 //! speaks only OTLP to `OTEL_EXPORTER_OTLP_ENDPOINT`, so what runs behind that
 //! is purely a compose-file concern.
 //!
-//! # Still owed — Phase 8
+//! # Telemetry chaos — Phase 8
 //!
-//! The exporter shim applying [`testbed_core::TelemetryFault`]. It goes in the
-//! export path and **only** there (invariant 11): corrupting spans where they
-//! are created poisons the testbed's own debuggability, whereas corrupting them
-//! on the way out confines the damage to what leaves the process.
+//! The exporter shim applying [`testbed_core::TelemetryFault`] lives in
+//! [`chaos`]. It is in the export path and **only** there (invariant 11):
+//! corrupting spans where they are created poisons the testbed's own
+//! debuggability, whereas corrupting them on the way out confines the damage to
+//! what leaves the process.
 //!
 //! The export path is also exempt from invariant 4 — it emits no bus events.
 //! Export emits an event, the event triggers instrumentation, instrumentation
 //! queues a span, export runs again; the batch exporter delays the recursion
 //! just long enough to make it puzzling (trap T13).
 
+pub mod chaos;
 pub mod metrics;
 pub mod propagation;
 pub mod wall;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -52,12 +55,16 @@ pub fn otlp_endpoint() -> String {
 pub struct Telemetry {
     provider: Option<SdkTracerProvider>,
     prometheus: PrometheusHandle,
+    /// Read at scrape time so `cardinality_bomb` and `counter_reset` corrupt the
+    /// rendered text rather than the recorder. See [`chaos`].
+    faults: Arc<dyn chaos::Faults>,
 }
 
 impl Telemetry {
-    /// Renders the Prometheus exposition format for `/metrics`.
+    /// Renders the Prometheus exposition format for `/metrics`, with any
+    /// configured metric faults applied to the *text* on the way out.
     pub fn render_metrics(&self) -> String {
-        self.prometheus.render()
+        chaos::corrupt_metrics(self.prometheus.render(), &self.faults.current())
     }
 
     /// Whether spans are actually being exported, or only logged.
@@ -86,7 +93,7 @@ impl Telemetry {
 /// A collector that is unreachable is **not** fatal: the testbed is routinely
 /// run without the `obs` profile, and refusing to boot would make the base
 /// stack useless. Export is skipped and everything else still works.
-pub fn init(run: testbed_core::RunId) -> Telemetry {
+pub fn init(run: testbed_core::RunId, faults: Arc<dyn chaos::Faults>) -> Telemetry {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,testbed=debug"));
 
@@ -94,7 +101,7 @@ pub fn init(run: testbed_core::RunId) -> Telemetry {
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    let provider = build_provider(run);
+    let provider = build_provider(run, Arc::clone(&faults));
     let registry = tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer());
@@ -117,10 +124,14 @@ pub fn init(run: testbed_core::RunId) -> Telemetry {
     Telemetry {
         provider,
         prometheus,
+        faults,
     }
 }
 
-fn build_provider(run: testbed_core::RunId) -> Option<SdkTracerProvider> {
+fn build_provider(
+    run: testbed_core::RunId,
+    faults: Arc<dyn chaos::Faults>,
+) -> Option<SdkTracerProvider> {
     use opentelemetry_otlp::WithExportConfig;
 
     let endpoint = otlp_endpoint();
@@ -133,7 +144,8 @@ fn build_provider(run: testbed_core::RunId) -> Option<SdkTracerProvider> {
     match exporter {
         Ok(exporter) => Some(
             SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
+                // Invariant 11: every span leaves through the shim.
+                .with_batch_exporter(chaos::ChaosExporter::new(exporter, faults))
                 .with_resource(
                     Resource::builder()
                         .with_service_name(SERVICE_NAME)

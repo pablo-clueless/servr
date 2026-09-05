@@ -74,3 +74,138 @@ async fn the_assembled_router_serves_both_planes() {
     );
     assert_eq!(get(app, "/api/ping").await.status(), StatusCode::OK);
 }
+
+/// Phase 8: the exporter shim reads its faults from the resolved scenario, so
+/// what `/_admin/telemetry/faults` writes has to be what `FromState` hands the
+/// shim. This is the wiring the whole phase rests on and nothing else asserts it
+/// — the chaos unit tests take a `TelemetryFault` directly.
+#[tokio::test]
+async fn telemetry_faults_written_by_admin_reach_the_exporter_shim() {
+    use testbed_telemetry::chaos::Faults;
+
+    let state = state_with(vec![]);
+    let source = testbed_telemetry::chaos::FromState(Arc::clone(&state));
+    assert_eq!(
+        source.current(),
+        testbed_core::TelemetryFault::default(),
+        "a scenario with no [telemetry] table must export honest telemetry"
+    );
+
+    let app = testbed_admin::router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_admin/telemetry/faults")
+                .body(Body::from(
+                    r#"{"rate":1.0,"orphan_spans":true,"clock_skew_ms":3600000}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let live = source.current();
+    assert_eq!(live.rate, 1.0);
+    assert!(live.orphan_spans);
+    assert_eq!(live.clock_skew_ms, Some(3_600_000));
+}
+
+/// Invariant 2: `reset` reconstructs a known-good state from the scenario
+/// alone. Telemetry corruption that survived a reset would leave the next test
+/// running against a source that lies, with nothing in its own setup to explain
+/// why.
+#[tokio::test]
+async fn reset_restores_the_scenarios_telemetry_faults() {
+    use testbed_telemetry::chaos::Faults;
+
+    let state = state_with(vec![]);
+    let source = testbed_telemetry::chaos::FromState(Arc::clone(&state));
+
+    state.mutate(|overlay| {
+        overlay.telemetry = Some(testbed_core::TelemetryFault {
+            rate: 1.0,
+            drop_export: true,
+            ..Default::default()
+        })
+    });
+    assert!(source.current().drop_export);
+
+    state.reset();
+
+    assert_eq!(
+        source.current(),
+        testbed_core::TelemetryFault::default(),
+        "telemetry corruption survived a reset"
+    );
+}
+
+/// Phase 9: the assembly `--restore` performs.
+///
+/// The round-trip through the file is covered by `core::snapshot`'s own tests.
+/// What is only exercised here is how `main` rebuilds a `State` from one —
+/// base from the snapshot, overlay applied afterwards — and that getting that
+/// order wrong is what would break `reset`.
+#[tokio::test]
+async fn a_restored_state_reproduces_the_control_plane_and_still_resets() {
+    use std::time::Duration;
+
+    // A scenario with a fault of its own, so base and overlay are distinguishable.
+    let seeded = state_with(vec![FaultSpec {
+        route: "/seeded/*".into(),
+        rate: 0.25,
+        ..Default::default()
+    }]);
+    seeded.clock().advance(Duration::from_secs(3_600));
+    seeded.mutate(|overlay| {
+        overlay.faults = Some(vec![FaultSpec {
+            route: "/api/*".into(),
+            rate: 1.0,
+            latency_ms: Some(250),
+            ..Default::default()
+        }]);
+        overlay.telemetry = Some(testbed_core::TelemetryFault {
+            rate: 1.0,
+            cardinality_bomb: Some(1234),
+            ..Default::default()
+        });
+    });
+
+    let snapshot = testbed_core::Snapshot::capture(&seeded);
+
+    // Exactly what `main` does on `--restore`.
+    let clock = Arc::new(snapshot.restore_clock());
+    let bus = Arc::new(BroadcastBus::new(16, Arc::clone(&clock), snapshot.run));
+    let restored = Arc::new(State::new(
+        snapshot.base.clone(),
+        Arc::clone(&clock),
+        bus,
+        snapshot.run,
+    ));
+    restored.mutate(|overlay| *overlay = snapshot.overlay.clone());
+
+    assert_eq!(restored.run(), seeded.run(), "the run id was not restored");
+    assert_eq!(clock.offset_ms(), 3_600_000);
+
+    let resolved = restored.resolved();
+    assert_eq!(resolved.faults.len(), 1);
+    assert_eq!(resolved.faults[0].route, "/api/*");
+    assert_eq!(resolved.telemetry.cardinality_bomb, Some(1234));
+    drop(resolved);
+
+    // Invariant 2 on a restored process: `reset` lands on the *scenario*, not
+    // on the overlay that was live when the snapshot was taken. Applying the
+    // overlay to `base` instead of through `mutate` would pass every assertion
+    // above and fail this one.
+    restored.reset();
+    let after = restored.resolved();
+    assert_eq!(
+        after.faults.len(),
+        1,
+        "reset did not land on the snapshot's base scenario"
+    );
+    assert_eq!(after.faults[0].route, "/seeded/*");
+    assert_eq!(after.telemetry, testbed_core::TelemetryFault::default());
+    assert_eq!(clock.offset_ms(), 0, "reset left the clock advanced");
+}

@@ -60,6 +60,57 @@ pub fn extract(headers: &HeaderMap) -> Context {
     TraceContextPropagator::new().extract(&HeaderExtractor(headers))
 }
 
+/// [`extract`], with [`TelemetryFault::corrupt_inbound_traceparent`] applied.
+///
+/// # The one fault that is not an export-side fault
+///
+/// Invariant 11 says telemetry faults are injected at export. This one cannot
+/// be: it corrupts what *arrives*, so there is no later point at which to do
+/// it. The invariant's reasoning still holds, though — it exists so the
+/// testbed's own spans stay trustworthy, and mangling an inbound header does
+/// not touch them. What breaks is the *join* between a client's trace and ours,
+/// which is precisely the failure being simulated: a client sends valid context
+/// and finds its trace severed anyway.
+///
+/// Applied on the data-plane HTTP surface, where a browser's or a service's
+/// `traceparent` actually arrives. The webhook capture inbox deliberately does
+/// not apply it — a webhook receiver is a thing the testbed *provides*, and
+/// corrupting context there would simulate a broken intermediary rather than a
+/// broken source.
+///
+/// [`TelemetryFault::corrupt_inbound_traceparent`]: testbed_core::TelemetryFault::corrupt_inbound_traceparent
+pub fn extract_faulted(headers: &HeaderMap, fault: &testbed_core::TelemetryFault) -> Context {
+    if !fault.corrupt_inbound_traceparent || fault.rate <= 0.0 {
+        return extract(headers);
+    }
+    if rand::random::<f64>() >= fault.rate {
+        return extract(headers);
+    }
+
+    // Rewriting the trace id rather than deleting the header: a *missing*
+    // traceparent is correctly handled by starting a fresh trace, which looks
+    // like ordinary behaviour. A well-formed header pointing at a trace that
+    // does not exist is the one that produces a plausibly broken join.
+    let mut mangled = headers.clone();
+    if let Some(value) = headers.get(TRACEPARENT).and_then(|v| v.to_str().ok()) {
+        let parts: Vec<&str> = value.split('-').collect();
+        if parts.len() == 4 {
+            let replacement = format!(
+                "{}-{}-{}-{}",
+                parts[0],
+                hex::encode(rand::random::<[u8; 16]>()),
+                parts[2],
+                parts[3]
+            );
+            if let Ok(header) = HeaderValue::from_str(&replacement) {
+                mangled.insert(TRACEPARENT, header);
+            }
+        }
+    }
+
+    extract(&mangled)
+}
+
 /// Writes the current context onto outbound headers, so the receiver can
 /// continue this trace.
 pub fn inject(context: &Context, headers: &mut HeaderMap) {
