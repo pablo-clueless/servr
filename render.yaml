@@ -60,8 +60,10 @@ services:
           name: servr-redis
           property: connectionString
 
-      # The server reads TESTBED_PORT first and falls back to Render's PORT, so
-      # this is belt-and-braces rather than required.
+      # The server reads TESTBED_PORT first and falls back to Render's PORT.
+      # Both are belt-and-braces: Render also auto-detects whichever port the
+      # process actually binds, which is how a deploy with neither set still
+      # comes up (observed 2026-09-05 — it bound 8080 and Render found it).
       - key: TESTBED_PORT
         value: "10000"
 
@@ -75,10 +77,20 @@ services:
       - key: RUST_LOG
         value: info,testbed=debug
 
-      # No OTLP collector in this blueprint. The server treats an unreachable
-      # collector as non-fatal — it logs a warning and skips export — so traces
-      # are simply not emitted. Point this at a collector (Grafana Cloud,
-      # Honeycomb, a private service) to turn them on.
+      # No OTLP collector in this blueprint, so export is switched off.
+      #
+      # This is not optional tidiness. Building the exporter succeeds without
+      # connecting to anything, so leaving it on with no collector boots
+      # reporting `exporting=true` and then logs
+      # `BatchSpanProcessor.ExportError` at ERROR level every five seconds
+      # forever — observed on the first live deploy, where it was the only
+      # thing in the log. The default endpoint is localhost:4317, which is
+      # correct for `compose --profile obs` and wrong here.
+      #
+      # To turn tracing on: delete this and set OTEL_EXPORTER_OTLP_ENDPOINT to
+      # a real collector (Grafana Cloud, Honeycomb, a private service).
+      - key: OTEL_SDK_DISABLED
+        value: "true"
       # - key: OTEL_EXPORTER_OTLP_ENDPOINT
       #   sync: false
 
@@ -102,6 +114,30 @@ databases:
     plan: basic-256mb
     region: oregon
 
+# ---------------------------------------------------------------------------
+# Using a Postgres or Redis that is not in this blueprint
+#
+# Any managed provider — Render's own, Neon, Supabase, Upstash — requires TLS.
+# The workspace now builds sqlx and redis with rustls (webpki roots), so this
+# works out of the box; before that it failed as:
+#
+#   Postgres unreachable (error occurred while attempting to establish a TLS
+#   connection: TLS upgrade required by connect options but SQLx was built
+#   without TLS support enabled)
+#
+# which reads as a network problem and is actually a build one. Two things to
+# check if you swap in an external URL:
+#
+#   • Postgres: keep `sslmode=require` in the DSN. A `channel_binding=require`
+#     parameter (Neon adds one) is ignored by sqlx with a warning — harmless.
+#   • Redis: use the `rediss://` scheme, not `redis://`. A plaintext URL
+#     against a TLS-only endpoint is refused at the socket, which surfaces as
+#     `Connection refused (os error 111)` and looks like the wrong host.
+#
+# Both clients degrade rather than crash: `/api/items` answers 503 without
+# Postgres, and the queue falls back to in-memory without Redis. Read the boot
+# log — it says which one it got.
+#
 # ---------------------------------------------------------------------------
 # What is not here, and why
 #
