@@ -18,8 +18,12 @@ const BUS_CAPACITY: usize = 1024;
 #[tokio::main]
 async fn main() {
     let run = RunId::new();
-    let telemetry = Arc::new(testbed_telemetry::init(run));
 
+    // Order matters: the exporter shim reads its faults from `State`, so the
+    // control plane has to exist before telemetry is installed. That puts
+    // scenario loading ahead of the subscriber, which is why the failure below
+    // is an `eprintln!` — there is nothing to log through yet, and a fatal boot
+    // error has to be visible regardless.
     let scenario_path =
         std::env::var("TESTBED_SCENARIO").unwrap_or_else(|_| "scenarios/default.toml".to_string());
     let scenario = match Scenario::from_path(&scenario_path) {
@@ -27,7 +31,7 @@ async fn main() {
         Err(e) => {
             // Booting with a silently empty scenario would make every later
             // assertion meaningless, so this is fatal.
-            tracing::error!("{e}");
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
@@ -35,6 +39,11 @@ async fn main() {
     let clock = Arc::new(Clock::new());
     let bus = Arc::new(BroadcastBus::new(BUS_CAPACITY, Arc::clone(&clock), run));
     let state = Arc::new(State::new(scenario, Arc::clone(&clock), bus, run));
+
+    let telemetry = Arc::new(testbed_telemetry::init(
+        run,
+        Arc::new(testbed_telemetry::chaos::FromState(Arc::clone(&state))),
+    ));
 
     tracing::info!(
         run = %run,
@@ -52,6 +61,16 @@ async fn main() {
     }
     if let Some(blast) = &state.base().blast_radius {
         tracing::warn!(blast_radius = %blast, "scenario blast radius");
+    }
+    // A scenario that seeds telemetry corruption has to say so at boot, or the
+    // first person to look at the collector spends the afternoon debugging the
+    // testbed instead of using it.
+    let seeded = &state.base().telemetry;
+    if seeded.rate > 0.0 {
+        tracing::warn!(
+            rate = seeded.rate,
+            "scenario seeds telemetry faults; exported telemetry is deliberately wrong"
+        );
     }
 
     // The data plane is optional. Without Postgres the HTTP, telemetry and

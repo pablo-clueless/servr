@@ -1,0 +1,50 @@
+# Plausibly broken traces. The payload for "test dev tools".
+#
+# A well-behaved telemetry source is easy and every observability tool works
+# against one. What nobody can test against is a source that is *almost* right:
+# spans that arrive, parse, and are individually well-formed, but whose tree
+# does not reconstruct. That is what this emits.
+#
+# Every fault here is applied in the exporter shim (invariant 11), so the
+# testbed's own `/_admin/events` and logs stay honest while the collector sees
+# garbage. If the testbed itself starts looking broken while running this
+# scenario, that is a real bug and not this file.
+
+name = "broken-traces"
+description = "Spans reach the collector orphaned, skewed an hour into the future, and occasionally not at all."
+
+blast_radius = """
+Trace data only, and only at the collector. Jaeger will show traces with \
+dangling parent references and spans dated an hour ahead; anything computing \
+service latency from them will produce nonsense, and a waterfall UI may refuse \
+to render them at all — that is the test. Metrics are untouched. Nothing is \
+written to Postgres, Redis or Mailpit. Clearing is immediate: \
+`DELETE /_admin/telemetry/faults`, or `POST /_admin/reset` to return here.
+"""
+
+# No HTTP faults: the point is that the *service* behaves perfectly while its
+# telemetry lies. A scenario that broke both could not distinguish a tool that
+# mishandles bad traces from one that mishandles bad responses.
+faults = []
+
+webhooks = []
+
+[telemetry]
+# Every export is corrupted. Set below 1.0 for the harder case — a tool that
+# copes with uniformly broken traces often falls over on intermittently broken
+# ones, because the good traces set an expectation the bad ones violate.
+rate = 1.0
+
+# A parent span id that appears nowhere in the trace. The single most common
+# real-world cause is a service that drops its parent's export while keeping
+# its own.
+orphan_spans = true
+
+# One hour into the future. Clock skew between hosts is endemic and most
+# backends handle it by silently reordering, which is worse than rejecting.
+clock_skew_ms = 3600000
+
+# A client sends valid W3C context and finds its trace severed anyway. This is
+# the one fault applied on the way *in* rather than at export — see
+# `propagation::extract_faulted` for why it cannot be an export-side fault.
+corrupt_inbound_traceparent = true

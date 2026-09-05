@@ -1,0 +1,44 @@
+# A metrics cardinality explosion, on demand.
+#
+# Read the blast radius before running this one. It is the only scenario in the
+# tree that will degrade something outside the testbed, and that is deliberate:
+# "what does your monitoring stack do when a service starts emitting fifty
+# thousand new label values per scrape" has no honest answer that does not
+# involve trying it.
+
+name = "cardinality-bomb"
+description = "Emits 50,000 unique label values on every scrape. Will degrade whatever is scraping it."
+
+blast_radius = """
+DESTRUCTIVE to the scraping backend. Each scrape of /metrics emits 50,000 \
+series with label values that are fresh every time, so the damage compounds \
+per scrape rather than converging: at a 15s interval that is ~200,000 new \
+series per minute. Prometheus will grow its head block, slow its queries, and \
+may OOM depending on its memory limit; Grafana dashboards over it will time \
+out. This is why the obs stack sits behind the `obs` compose profile — do not \
+point this at a shared or production Prometheus.
+
+Recovery: `DELETE /_admin/telemetry/faults` stops new series immediately, but \
+the ones already ingested persist for the backend's full retention. For a \
+local stack the fast fix is `docker compose down -v` and losing the volume. \
+Nothing else is affected — traces, Postgres, Redis and Mailpit are untouched, \
+and the testbed's own recorder is never written to (the bomb is added to the \
+rendered exposition text, so the testbed's real metrics stay correct and \
+readable underneath it).
+"""
+
+faults = []
+webhooks = []
+
+[telemetry]
+rate = 1.0
+
+# Series per scrape. 50_000 is the figure in the HANDOFF §7 gate. Start much
+# lower — 1_000 — if you are pointing this at anything you care about, and
+# watch ingestion before turning it up.
+cardinality_bomb = 50000
+
+# Also make the counters lie about restarts, so `rate()` over them is wrong in
+# the ordinary way at the same time as the cardinality is wrong in the dramatic
+# way. A backend that survives the bomb may still get the arithmetic wrong.
+counter_reset = true

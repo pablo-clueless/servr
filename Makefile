@@ -22,6 +22,7 @@ help:
 	@echo "  gate-5        Phase 5 gate: ws + streams, in-process"
 	@echo "  gate-6        Phase 6 gate: mail through Mailpit, run-isolated"
 	@echo "  gate-7        Phase 7 gate: webhooks, signing + virtual backoff"
+	@echo "  gate-8        Phase 8 gate: telemetry chaos (obs profile for live)"
 	@echo ""
 	@echo "  Jaeger  http://localhost:16686   Mailpit http://localhost:8025"
 	@echo "  Prom    http://localhost:9090    Admin   http://localhost:8080/_admin/health"
@@ -116,6 +117,13 @@ gate-7:
 	cargo test -p testbed-server --test webhook_gate -- --nocapture
 	cargo test -p testbed-hooks -- --nocapture
 
+# Phase 8 gate, in-process. The shim is asserted against real `SpanData` and
+# real exposition text, so it needs no collector; `gate-8-live` is the half that
+# proves it at Jaeger.
+.PHONY: gate-8
+gate-8:
+	cargo test -p testbed-telemetry -- --nocapture
+
 # Phase 6 gate. Needs Mailpit; skips itself without MAILPIT_API rather than
 # failing, so it runs the moment infra is up.
 .PHONY: gate-6
@@ -147,5 +155,7 @@ gates: up invariants
 	  cargo test -p testbed-mail --test mailpit -- --nocapture
 	@echo "=== phase 7: webhooks (needs no infra) ==="
 	$(MAKE) gate-7
+	@echo "=== phase 8: telemetry chaos (needs no infra) ==="
+	$(MAKE) gate-8
 	@echo
 	@echo "phase 2b still needs the obs profile: make up-obs && make gate-2b"

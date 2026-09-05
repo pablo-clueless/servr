@@ -16,7 +16,7 @@
 //!
 //! # Still owed
 //!
-//! `/_admin/telemetry/faults` (Phase 8), `/_admin/snapshot` (9).
+//! `/_admin/snapshot` (Phase 9).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -52,6 +52,12 @@ pub fn router(state: Shared) -> Router {
             get(list_faults).post(add_fault).delete(clear_faults),
         )
         .route("/_admin/events", get(events))
+        .route(
+            "/_admin/telemetry/faults",
+            get(telemetry_faults)
+                .post(set_telemetry_faults)
+                .delete(clear_telemetry_faults),
+        )
         .with_state(state)
 }
 
@@ -585,6 +591,41 @@ async fn freeze(State(state): State<Shared>) -> Json<Value> {
 async fn resume(State(state): State<Shared>) -> Json<Value> {
     state.clock().resume();
     Json(json!({ "ok": true, "now": state.clock().now(), "frozen": false }))
+}
+
+/// Phase 8: the corruption the exporter shim applies.
+///
+/// This is control-plane config like any other — seeded by the scenario's
+/// `[telemetry]` table, overridden here, restored by `reset`. The shim reads
+/// the resolved value on every export, so a change takes effect on the next
+/// batch without a restart.
+async fn telemetry_faults(State(state): State<Shared>) -> Json<testbed_core::TelemetryFault> {
+    Json(state.resolved().telemetry.clone())
+}
+
+/// Replaces the whole fault, rather than merging: these fields interact (a
+/// `rate` of 0 disables every other one), and a partial update would leave
+/// callers guessing which of the nine are still set from last time.
+async fn set_telemetry_faults(
+    State(state): State<Shared>,
+    Lenient(fault): Lenient<testbed_core::TelemetryFault>,
+) -> Json<Value> {
+    tracing::warn!(
+        rate = fault.rate,
+        orphan_spans = fault.orphan_spans,
+        drop_export = fault.drop_export,
+        cardinality_bomb = ?fault.cardinality_bomb,
+        "telemetry faults set; exported telemetry is now deliberately wrong"
+    );
+    state.mutate(|overlay| overlay.telemetry = Some(fault.clone()));
+    Json(json!({ "ok": true, "telemetry": fault }))
+}
+
+/// Back to honest telemetry, including when the *scenario* seeded faults —
+/// `reset` puts the scenario's back, this does not.
+async fn clear_telemetry_faults(State(state): State<Shared>) -> Json<Value> {
+    state.mutate(|overlay| overlay.telemetry = Some(testbed_core::TelemetryFault::default()));
+    Json(json!({ "ok": true }))
 }
 
 async fn list_faults(State(state): State<Shared>) -> Json<Vec<FaultSpec>> {

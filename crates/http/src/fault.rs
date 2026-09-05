@@ -136,7 +136,10 @@ pub async fn layer(
     // a new trace — the correct fallback, and the observable effect of the
     // `corrupt_inbound_traceparent` telemetry fault.
     if span
-        .set_parent(testbed_telemetry::propagation::extract(request.headers()))
+        .set_parent(testbed_telemetry::propagation::extract_faulted(
+            request.headers(),
+            &state.resolved().telemetry,
+        ))
         .is_err()
     {
         tracing::trace!("no inbound trace context; starting a new trace");
