@@ -42,11 +42,21 @@ futures-util = "0.3"
 # SMTP client only. Mailpit owns the server side (§2 decision 6) — nothing here
 # may grow into an embedded SMTP server. No TLS feature: Mailpit on localhost is
 # plaintext, and the testbed never speaks SMTP to anything else.
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
+# `tokio1-rustls-tls` + `ring` add STARTTLS and let SMTP AUTH be used, which
+# an authenticated relay (Brevo, SES, Postmark) requires. Mailpit still gets
+# the plaintext path — see `send::Sender::new`. Decision 6 is untouched:
+# this is still a client, never an embedded SMTP server.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "ring"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 opentelemetry = "0.32"
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
+# TLS is not optional: decision 9 makes OTLP a first-class output surface, and
+# every hosted collector (Grafana Cloud, Honeycomb, Dash0, Uptrace) is https.
+# Without a provider *and* a root store, tonic can only reach a plaintext
+# collector on localhost — which makes the testbed undeployable as the
+# telemetry source it exists to be. webpki roots so a slim image needs no
+# system ca-certificates.
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "tls-ring", "tls-webpki-roots"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry_sdk-testing = { package = "opentelemetry_sdk", version = "0.32", features = ["testing"] }
 proptest = "1"
@@ -83,6 +93,7 @@ toml = "0.9"
 tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["trace"] }
 tracing = "0.1.44"
+tonic = { version = "0.14", default-features = false }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.26.0", features = ["v4", "serde"] }

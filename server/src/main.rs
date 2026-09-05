@@ -189,7 +189,30 @@ async fn main() {
         ) {
             Ok(mailer) => match mailer.probe().await {
                 Ok(version) => {
-                    tracing::info!(smtp = %config.smtp, api = %config.api, %version, "mailpit ready");
+                    if let Some(relay) = &config.relay {
+                        // Loud, and every boot. This is the configuration where
+                        // a mistake sends real mail to real people from a
+                        // public, unauthenticated endpoint.
+                        if config.allowed.is_empty() {
+                            tracing::error!(
+                                host = %relay.host,
+                                "mail relay configured with no MAIL_ALLOWED_RECIPIENTS;                                  every send will be refused. Set it to the domains this                                  testbed may write to."
+                            );
+                        } else if config.allowed.is_unrestricted() {
+                            tracing::error!(
+                                host = %relay.host,
+                                "mail relay allows ANY recipient (MAIL_ALLOWED_RECIPIENTS=*)                                  and /_admin is unauthenticated: anyone who can reach this                                  server can send mail from your account to anyone."
+                            );
+                        } else {
+                            tracing::warn!(
+                                host = %relay.host,
+                                allowed = %config.allowed,
+                                "mail is RELAYED for real; /_admin/mail read-back is unavailable"
+                            );
+                        }
+                    } else {
+                        tracing::info!(smtp = %config.smtp, api = %config.api, %version, "mailpit ready");
+                    }
                     Some(Arc::new(mailer))
                 }
                 Err(e) => {

@@ -43,6 +43,17 @@ struct Harness {
     bus: Arc<BroadcastBus>,
 }
 
+impl Harness {
+    /// These tests all run in Mailpit mode, where an inbox is always present.
+    /// Relay mode has none — that is what `Mailer::inbox` returning `Option`
+    /// encodes, and it is asserted separately in the crate's unit tests.
+    fn inbox(&self) -> &testbed_mail::Inbox {
+        self.mailer
+            .inbox()
+            .expect("mailpit mode always has an inbox")
+    }
+}
+
 fn harness() -> Harness {
     let config = MailConfig::from_env();
     let run = RunId::new();
@@ -76,6 +87,7 @@ async fn a_sent_message_comes_back_for_its_own_run() {
     let inbox = h
         .mailer
         .inbox()
+        .expect("mailpit mode always has an inbox")
         .for_run(run, None, 50)
         .await
         .expect("read failed");
@@ -110,8 +122,8 @@ async fn one_run_cannot_read_another_runs_mail() {
     h.mailer.send(a, mail("a@b.c", "for-a")).await.unwrap();
     h.mailer.send(b, mail("b@b.c", "for-b")).await.unwrap();
 
-    let for_a = h.mailer.inbox().for_run(a, None, 100).await.unwrap();
-    let for_b = h.mailer.inbox().for_run(b, None, 100).await.unwrap();
+    let for_a = h.inbox().for_run(a, None, 100).await.unwrap();
+    let for_b = h.inbox().for_run(b, None, 100).await.unwrap();
 
     assert_eq!(for_a.len(), 1, "run A sees {} messages", for_a.len());
     assert_eq!(for_a[0].subject, "for-a");
@@ -135,6 +147,7 @@ async fn a_run_that_sent_nothing_reads_nothing() {
     let inbox = h
         .mailer
         .inbox()
+        .expect("mailpit mode always has an inbox")
         .for_run(RunId::new(), None, 100)
         .await
         .unwrap();
@@ -167,6 +180,7 @@ async fn a_search_query_narrows_within_a_run_without_crossing_runs() {
     let for_a = h
         .mailer
         .inbox()
+        .expect("mailpit mode always has an inbox")
         .for_run(a, Some(&query), 100)
         .await
         .unwrap();
@@ -250,7 +264,7 @@ async fn untagged_mail_belongs_to_no_run() {
 
     let h = harness();
     assert_eq!(
-        h.mailer.inbox().run_header(id).await.unwrap(),
+        h.inbox().run_header(id).await.unwrap(),
         None,
         "a message with no run header was attributed to a run"
     );

@@ -399,10 +399,15 @@ async fn mail_list(
     let limit = params.limit.unwrap_or(testbed_mail::inbox::DEFAULT_LIMIT);
     let query = params.query.as_deref();
 
+    // Relay mode has no inbox — say so rather than serving an empty list,
+    // which would read as "your run sent nothing" and is the one answer a mail
+    // assertion must never get wrong (T7's failure mode, one layer up).
+    let inbox = mailer.inbox().ok_or(testbed_mail::MailError::NoInbox)?;
+
     let messages = if params.all {
-        mailer.inbox().all(query, limit).await?
+        inbox.all(query, limit).await?
     } else {
-        mailer.inbox().for_run(run, query, limit).await?
+        inbox.for_run(run, query, limit).await?
     };
 
     Ok(Json(json!({
@@ -421,7 +426,8 @@ async fn mail_purge(
     State((mailer, _)): State<(MaybeMailer, Shared)>,
 ) -> Result<Json<Value>, MailApiError> {
     let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
-    mailer.inbox().purge().await?;
+    let inbox = mailer.inbox().ok_or(testbed_mail::MailError::NoInbox)?;
+    inbox.purge().await?;
     Ok(Json(json!({ "ok": true, "scope": "all runs" })))
 }
 
@@ -437,9 +443,16 @@ enum MailApiError {
 
 impl axum::response::IntoResponse for MailApiError {
     fn into_response(self) -> axum::response::Response {
+        use testbed_mail::MailError;
+
         let status = match &self {
             Self::Unconfigured => axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Self::BadRun(_) => axum::http::StatusCode::BAD_REQUEST,
+            // Refused on purpose, by policy — not a server fault and not
+            // retryable, so 403 rather than 502.
+            Self::Mail(MailError::RecipientNotAllowed { .. }) => axum::http::StatusCode::FORBIDDEN,
+            // The surface exists but this transport cannot provide it.
+            Self::Mail(MailError::NoInbox) => axum::http::StatusCode::NOT_IMPLEMENTED,
             // A send that fails because Mailpit went away is not the caller's
             // fault, and 502 says so more usefully than 500.
             Self::Mail(_) => axum::http::StatusCode::BAD_GATEWAY,
