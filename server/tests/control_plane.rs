@@ -74,3 +74,69 @@ async fn the_assembled_router_serves_both_planes() {
     );
     assert_eq!(get(app, "/api/ping").await.status(), StatusCode::OK);
 }
+
+/// Phase 8: the exporter shim reads its faults from the resolved scenario, so
+/// what `/_admin/telemetry/faults` writes has to be what `FromState` hands the
+/// shim. This is the wiring the whole phase rests on and nothing else asserts it
+/// — the chaos unit tests take a `TelemetryFault` directly.
+#[tokio::test]
+async fn telemetry_faults_written_by_admin_reach_the_exporter_shim() {
+    use testbed_telemetry::chaos::Faults;
+
+    let state = state_with(vec![]);
+    let source = testbed_telemetry::chaos::FromState(Arc::clone(&state));
+    assert_eq!(
+        source.current(),
+        testbed_core::TelemetryFault::default(),
+        "a scenario with no [telemetry] table must export honest telemetry"
+    );
+
+    let app = testbed_admin::router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_admin/telemetry/faults")
+                .body(Body::from(
+                    r#"{"rate":1.0,"orphan_spans":true,"clock_skew_ms":3600000}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let live = source.current();
+    assert_eq!(live.rate, 1.0);
+    assert!(live.orphan_spans);
+    assert_eq!(live.clock_skew_ms, Some(3_600_000));
+}
+
+/// Invariant 2: `reset` reconstructs a known-good state from the scenario
+/// alone. Telemetry corruption that survived a reset would leave the next test
+/// running against a source that lies, with nothing in its own setup to explain
+/// why.
+#[tokio::test]
+async fn reset_restores_the_scenarios_telemetry_faults() {
+    use testbed_telemetry::chaos::Faults;
+
+    let state = state_with(vec![]);
+    let source = testbed_telemetry::chaos::FromState(Arc::clone(&state));
+
+    state.mutate(|overlay| {
+        overlay.telemetry = Some(testbed_core::TelemetryFault {
+            rate: 1.0,
+            drop_export: true,
+            ..Default::default()
+        })
+    });
+    assert!(source.current().drop_export);
+
+    state.reset();
+
+    assert_eq!(
+        source.current(),
+        testbed_core::TelemetryFault::default(),
+        "telemetry corruption survived a reset"
+    );
+}
