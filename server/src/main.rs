@@ -257,7 +257,11 @@ async fn main() {
             testbed_hooks::router(Arc::clone(&hooks.inbox)),
         ));
 
+    // `PORT` is the fallback because that is what every managed host injects
+    // (Render, Fly, Heroku); `TESTBED_PORT` still wins so a local gate can move
+    // the server off 8080 without competing with whatever set `PORT`.
     let port: u16 = std::env::var("TESTBED_PORT")
+        .or_else(|_| std::env::var("PORT"))
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);

@@ -183,18 +183,49 @@ fn orphan_parent() -> SpanId {
     }
 }
 
-/// Shifts a timestamp, saturating rather than panicking.
+/// Widest skew applied in either direction: 100 years, in milliseconds.
 ///
-/// A skew large enough to underflow the epoch is a legitimate thing to ask for
-/// — "what does your backend do with a span from 1969" is a fair question — and
-/// it must not take the process down to answer it.
+/// Far beyond anything a real clock problem produces, and still a *timestamp* —
+/// which is the point. See [`shift`].
+pub const MAX_SKEW_MS: i64 = 100 * 365 * 24 * 60 * 60 * 1_000;
+
+/// Shifts a timestamp by `ms`, clamped to [`MAX_SKEW_MS`].
+///
+/// A skew that lands before the epoch is a legitimate thing to ask for — "what
+/// does your backend do with a span from 1969" is a fair question — so this
+/// does not floor at 1970. What it does refuse is arithmetic nonsense.
+///
+/// # Why the clamp, and not just `checked_add`/`checked_sub`
+///
+/// `SystemTime`'s representable range is **platform-dependent**. On Linux it is
+/// effectively unbounded, so subtracting `i64::MIN` milliseconds succeeds and
+/// yields a timestamp around 292 billion BC. On Windows it is a `FILETIME`,
+/// floored at 1601, so the same call returns `None` and falls back to the
+/// epoch. Same fault config, same input, two different exported timestamps
+/// depending on the host — which is precisely the kind of thing that makes a
+/// telemetry source untrustworthy, and this one exists to be trusted about
+/// being untrustworthy.
+///
+/// Clamping first makes the result identical everywhere, and keeps it inside
+/// the range every platform can represent. It also keeps the corruption
+/// *plausible*: the OTLP encoder converts a pre-epoch time with
+/// `duration_since(UNIX_EPOCH).unwrap_or_default()`, so a 292-billion-BC span
+/// is silently exported as 1970 anyway — all the absurdity buys is a value that
+/// no longer means what the operator asked for.
+///
+/// Found on 2026-09-05 by the Linux test run; the Windows one passed.
 fn shift(at: std::time::SystemTime, ms: i64) -> std::time::SystemTime {
+    let ms = ms.clamp(-MAX_SKEW_MS, MAX_SKEW_MS);
     let delta = Duration::from_millis(ms.unsigned_abs());
+
     let shifted = if ms >= 0 {
         at.checked_add(delta)
     } else {
         at.checked_sub(delta)
     };
+
+    // Unreachable for any realistic span time now that the skew is bounded, but
+    // a span carrying an already-absurd timestamp must still not panic here.
     shifted.unwrap_or(std::time::UNIX_EPOCH)
 }
 
@@ -408,15 +439,53 @@ mod tests {
     /// "What does your backend do with a span from before the epoch" is a fair
     /// question, and answering it must not panic the testbed.
     #[test]
-    fn an_absurd_negative_skew_saturates_instead_of_panicking() {
-        let skewed = corrupt_span(
-            span(),
+    fn an_absurd_skew_is_clamped_to_the_same_value_on_every_platform() {
+        let original = span();
+        let hundred_years = Duration::from_millis(MAX_SKEW_MS as u64);
+
+        let back = corrupt_span(
+            original.clone(),
             &TelemetryFault {
                 clock_skew_ms: Some(i64::MIN + 1),
                 ..fault()
             },
         );
-        assert_eq!(skewed.start_time, UNIX_EPOCH);
+        let forward = corrupt_span(
+            original.clone(),
+            &TelemetryFault {
+                clock_skew_ms: Some(i64::MAX),
+                ..fault()
+            },
+        );
+
+        // An absolute expectation, not "whatever this platform saturates to".
+        // The original assertion here was written against Windows, where
+        // `checked_sub` returns `None` below 1601 and the fallback kicked in;
+        // on Linux the same call succeeded and produced 292 billion BC.
+        assert_eq!(back.start_time, original.start_time - hundred_years);
+        assert_eq!(forward.start_time, original.start_time + hundred_years);
+
+        // Still a real timestamp, and still before the epoch — a 1923 span is
+        // the useful corruption; arithmetic garbage is not.
+        assert!(back.start_time < UNIX_EPOCH);
+    }
+
+    /// A skew inside the clamp is untouched by it.
+    #[test]
+    fn a_realistic_skew_is_not_clamped() {
+        let original = span();
+        let day = 24 * 60 * 60 * 1_000;
+        let skewed = corrupt_span(
+            original.clone(),
+            &TelemetryFault {
+                clock_skew_ms: Some(day),
+                ..fault()
+            },
+        );
+        assert_eq!(
+            skewed.start_time,
+            original.start_time + Duration::from_millis(day as u64)
+        );
     }
 
     #[test]
