@@ -145,11 +145,13 @@ async fn main() {
 
     // The scheduler polls against the virtual clock either way; Redis only
     // changes where jobs live, and whether they survive a restart.
+    let mut redis_backed = false;
     let store: Arc<dyn testbed_queue::JobStore> = match std::env::var("REDIS_URL") {
         Ok(url) => {
             match testbed_queue::RedisStore::connect(&url, run).await {
                 Ok(store) => {
                     tracing::info!("queue backed by Redis");
+                    redis_backed = true;
                     Arc::new(store)
                 }
                 Err(e) => {
@@ -187,7 +189,30 @@ async fn main() {
         ) {
             Ok(mailer) => match mailer.probe().await {
                 Ok(version) => {
-                    tracing::info!(smtp = %config.smtp, api = %config.api, %version, "mailpit ready");
+                    if let Some(relay) = &config.relay {
+                        // Loud, and every boot. This is the configuration where
+                        // a mistake sends real mail to real people from a
+                        // public, unauthenticated endpoint.
+                        if config.allowed.is_empty() {
+                            tracing::error!(
+                                host = %relay.host,
+                                "mail relay configured with no MAIL_ALLOWED_RECIPIENTS;                                  every send will be refused. Set it to the domains this                                  testbed may write to."
+                            );
+                        } else if config.allowed.is_unrestricted() {
+                            tracing::error!(
+                                host = %relay.host,
+                                "mail relay allows ANY recipient (MAIL_ALLOWED_RECIPIENTS=*)                                  and /_admin is unauthenticated: anyone who can reach this                                  server can send mail from your account to anyone."
+                            );
+                        } else {
+                            tracing::warn!(
+                                host = %relay.host,
+                                allowed = %config.allowed,
+                                "mail is RELAYED for real; /_admin/mail read-back is unavailable"
+                            );
+                        }
+                    } else {
+                        tracing::info!(smtp = %config.smtp, api = %config.api, %version, "mailpit ready");
+                    }
                     Some(Arc::new(mailer))
                 }
                 Err(e) => {
@@ -223,7 +248,17 @@ async fn main() {
     ));
     let streams = testbed_stream::Streams::new(Arc::clone(state.bus()), Arc::clone(&clock), run);
 
+    // What actually came up, for `GET /`. Read from the wiring above rather
+    // than re-probed, so the index cannot disagree with the boot log.
+    let surfaces = testbed_admin::Surfaces {
+        postgres: data.is_some(),
+        redis: redis_backed,
+        mailpit: mailer.is_some(),
+        tracing: telemetry.exporting(),
+    };
+
     let app = Router::new()
+        .merge(testbed_admin::index_router(Arc::clone(&state), surfaces))
         .merge(testbed_admin::router(Arc::clone(&state)))
         .merge(testbed_admin::jobs_router(
             Arc::clone(&scheduler),
@@ -255,7 +290,10 @@ async fn main() {
         .merge(testbed_http::fault::guard(
             Arc::clone(&state),
             testbed_hooks::router(Arc::clone(&hooks.inbox)),
-        ));
+        ))
+        // Anything no router claimed. axum's default 404 is an empty body,
+        // which is indistinguishable from a broken server in a browser.
+        .fallback(testbed_admin::not_found);
 
     // `PORT` is the fallback because that is what every managed host injects
     // (Render, Fly, Heroku); `TESTBED_PORT` still wins so a local gate can move
