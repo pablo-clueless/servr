@@ -1,26 +1,26 @@
 # Render blueprint for the testbed.
 #
-# ┌─────────────────────────────────────────────────────────────────────────┐
-# │ READ THIS BEFORE APPLYING                                                │
-# │                                                                          │
-# │ `/_admin` has no authentication, by design (HANDOFF §10: "not a          │
-# │ production server, no auth hardening"). Deployed as a `web` service it   │
-# │ is on the public internet, and anyone who finds the URL can:             │
-# │                                                                          │
-# │   • POST /_admin/hooks/out with any URL — the server will sign and send  │
-# │     a request to it from inside your Render private network. That is an  │
-# │     SSRF primitive pointed at your own infrastructure.                   │
-# │   • DELETE /_admin/runs/{id} — drops Postgres schemas.                   │
-# │   • POST /_admin/telemetry/faults with cardinality_bomb — 50,000 fresh   │
-# │     series per scrape at whatever is scraping it.                        │
-# │   • POST /_admin/faults — make every response fail, indefinitely.        │
-# │                                                                          │
-# │ Render has no built-in auth for web services. If this instance is not    │
-# │ meant to be world-reachable, change `type: web` to `type: pserv` below   │
-# │ (private service, reachable only from your other Render services), or    │
-# │ front it with Cloudflare Access or equivalent. Deploying it public is a  │
-# │ legitimate choice for a throwaway testbed — just an explicit one.        │
-# └─────────────────────────────────────────────────────────────────────────┘
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ READ THIS BEFORE APPLYING                                                 │
+# │                                                                           │
+# │ `/_admin` has no authentication, by design (HANDOFF §10: "not a           │
+# │ production server, no auth hardening"). Deployed as a `web` service it    │
+# │ is on the public internet, and anyone who finds the URL can:              │
+# │                                                                           │
+# │   • POST /_admin/hooks/out with any URL — the server will sign and send   │
+# │     a request to it from inside your Render private network. That is an   │
+# │     SSRF primitive pointed at your own infrastructure.                    │
+# │   • DELETE /_admin/runs/{id} — drops Postgres schemas.                    │
+# │   • POST /_admin/telemetry/faults with cardinality_bomb — 50,000 fresh    │
+# │     series per scrape at whatever is scraping it.                         │
+# │   • POST /_admin/faults — make every response fail, indefinitely.         │
+# │                                                                           │
+# │ Render has no built-in auth for web services. If this instance is not     │
+# │ meant to be world-reachable, change `type: web` to `type: pserv` below    │
+# │ (private service, reachable only from your other Render services), or     │
+# │ front it with Cloudflare Access or equivalent. Deploying it public is a   │
+# │ legitimate choice for a throwaway testbed — just an explicit one.         │
+# └───────────────────────────────────────────────────────────────────────────┘
 #
 # Apply with: Render Dashboard → Blueprints → New Blueprint Instance.
 
@@ -77,20 +77,17 @@ services:
       - key: RUST_LOG
         value: info,testbed=debug
 
-      # No OTLP collector in this blueprint, so export is switched off.
+      # Span export needs no configuration here. When
+      # OTEL_EXPORTER_OTLP_ENDPOINT is unset the server probes the default
+      # (localhost:4317) at boot and, finding nothing, disables export with a
+      # warning that says so — the same probe-and-degrade the Postgres, Redis
+      # and Mailpit paths use. Boot logs `exporting=false` and stays quiet.
       #
-      # This is not optional tidiness. Building the exporter succeeds without
-      # connecting to anything, so leaving it on with no collector boots
-      # reporting `exporting=true` and then logs
-      # `BatchSpanProcessor.ExportError` at ERROR level every five seconds
-      # forever — observed on the first live deploy, where it was the only
-      # thing in the log. The default endpoint is localhost:4317, which is
-      # correct for `compose --profile obs` and wrong here.
+      # `OTEL_SDK_DISABLED: "true"` still works if you want it stated outright.
       #
-      # To turn tracing on: delete this and set OTEL_EXPORTER_OTLP_ENDPOINT to
-      # a real collector (Grafana Cloud, Honeycomb, a private service).
-      - key: OTEL_SDK_DISABLED
-        value: "true"
+      # To turn tracing ON, set an endpoint. An explicitly configured one is
+      # trusted and never probed, so a collector that starts after the testbed
+      # still gets its spans:
       # - key: OTEL_EXPORTER_OTLP_ENDPOINT
       #   sync: false
 
@@ -133,6 +130,12 @@ databases:
 #   • Redis: use the `rediss://` scheme, not `redis://`. A plaintext URL
 #     against a TLS-only endpoint is refused at the socket, which surfaces as
 #     `Connection refused (os error 111)` and looks like the wrong host.
+#
+#     If you do not want Redis at all, **unset REDIS_URL** rather than leaving
+#     it pointing at nothing. Unset is a fast path — the queue says so and
+#     falls back to in-memory immediately. A set-but-unreachable URL costs
+#     ~10s of connect retries on every boot before the same fallback, which
+#     Render counts against your deploy's startup time.
 #
 # Both clients degrade rather than crash: `/api/items` answers 503 without
 # Postgres, and the queue falls back to in-memory without Redis. Read the boot
