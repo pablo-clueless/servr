@@ -16,8 +16,7 @@
 //!
 //! # Still owed
 //!
-//! `/_admin/hooks/*` (Phase 7), `/_admin/telemetry/faults` (8),
-//! `/_admin/snapshot` (9).
+//! `/_admin/telemetry/faults` (Phase 8), `/_admin/snapshot` (9).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -123,6 +122,101 @@ impl axum::response::IntoResponse for RunError {
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
+}
+
+/// Webhooks: read the capture inbox, queue an outbound delivery.
+pub fn hooks_router(hooks: Arc<testbed_hooks::Hooks>) -> Router {
+    Router::new()
+        .route("/_admin/hooks/in", get(hooks_summary))
+        .route(
+            "/_admin/hooks/in/{id}",
+            get(hooks_captures).delete(hooks_clear),
+        )
+        .route("/_admin/hooks/out", get(hooks_deliveries).post(hooks_send))
+        .with_state(hooks)
+}
+
+/// Phase 7 gate: `curl /_admin/hooks/in/abc | jq '.[0].body.x'` → `1`.
+///
+/// Serves a bare array, not an envelope: the gate indexes straight into `.[0]`,
+/// and wrapping it in `{"captures":[…]}` would be a nicer shape that fails the
+/// gate as written.
+async fn hooks_captures(
+    State(hooks): State<Arc<testbed_hooks::Hooks>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<Vec<testbed_hooks::Capture>> {
+    Json(hooks.inbox.captures(&id))
+}
+
+async fn hooks_summary(State(hooks): State<Arc<testbed_hooks::Hooks>>) -> Json<Value> {
+    Json(json!({ "endpoints": hooks.inbox.summary() }))
+}
+
+async fn hooks_clear(
+    State(hooks): State<Arc<testbed_hooks::Hooks>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<Value> {
+    hooks.inbox.clear(Some(&id));
+    Json(json!({ "ok": true, "endpoint": id }))
+}
+
+#[derive(Deserialize)]
+struct NewDelivery {
+    url: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// `stripe`, `github` or `none` (Q4). Defaults to Stripe.
+    #[serde(default)]
+    sign: Option<testbed_core::SigningScheme>,
+    #[serde(default)]
+    secret: Option<String>,
+    /// Retry offsets in **virtual** milliseconds, counted from the enqueue.
+    #[serde(default)]
+    backoff_ms: Option<Vec<u64>>,
+    #[serde(default)]
+    fail_first: Option<u32>,
+    #[serde(default)]
+    body: Option<Value>,
+}
+
+/// Phase 7 gate: queues a delivery and returns at once. The attempts follow as
+/// the virtual clock reaches them.
+async fn hooks_send(
+    State(hooks): State<Arc<testbed_hooks::Hooks>>,
+    Lenient(body): Lenient<NewDelivery>,
+) -> Json<Value> {
+    let endpoint = testbed_hooks::outbound::endpoint_from(
+        body.name,
+        body.url,
+        body.sign,
+        body.secret,
+        body.backoff_ms,
+        body.fail_first,
+    );
+
+    // Echoed back because the gate has to verify the delivered signature, and
+    // an endpoint that defaulted its secret gives the caller no other way to
+    // learn which one was used.
+    let secret = endpoint
+        .secret
+        .clone()
+        .unwrap_or_else(|| testbed_hooks::sign::DEFAULT_SECRET.to_string());
+    let scheme = endpoint.sign;
+
+    let id = hooks
+        .sender
+        .enqueue(endpoint, body.body.unwrap_or_else(|| json!({ "ok": true })));
+
+    Json(json!({
+        "ok": true,
+        "id": id.to_string(),
+        "sign": scheme,
+        "secret": secret,
+    }))
+}
+
+async fn hooks_deliveries(State(hooks): State<Arc<testbed_hooks::Hooks>>) -> Json<Value> {
+    Json(json!({ "deliveries": hooks.sender.deliveries() }))
 }
 
 /// Mail: send through Mailpit's SMTP, read back through its REST API.
