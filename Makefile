@@ -23,6 +23,7 @@ help:
 	@echo "  gate-6        Phase 6 gate: mail through Mailpit, run-isolated"
 	@echo "  gate-7        Phase 7 gate: webhooks, signing + virtual backoff"
 	@echo "  gate-8        Phase 8 gate: telemetry chaos (obs profile for live)"
+	@echo "  gate-9        Phase 9 gate: snapshot restores control plane only"
 	@echo ""
 	@echo "  Jaeger  http://localhost:16686   Mailpit http://localhost:8025"
 	@echo "  Prom    http://localhost:9090    Admin   http://localhost:8080/_admin/health"
@@ -124,6 +125,14 @@ gate-7:
 gate-8:
 	cargo test -p testbed-telemetry -- --nocapture
 
+# Phase 9 gate, in-process. The file round-trip and the assembly `--restore`
+# performs are both asserted; `gate-9-live` is the half that proves a real
+# data-plane wipe does not come back.
+.PHONY: gate-9
+gate-9:
+	cargo test -p testbed-core snapshot -- --nocapture
+	cargo test -p testbed-server --test control_plane -- --nocapture
+
 # Phase 6 gate. Needs Mailpit; skips itself without MAILPIT_API rather than
 # failing, so it runs the moment infra is up.
 .PHONY: gate-6
@@ -157,5 +166,7 @@ gates: up invariants
 	$(MAKE) gate-7
 	@echo "=== phase 8: telemetry chaos (needs no infra) ==="
 	$(MAKE) gate-8
+	@echo "=== phase 9: snapshot (needs no infra) ==="
+	$(MAKE) gate-9
 	@echo
 	@echo "phase 2b still needs the obs profile: make up-obs && make gate-2b"

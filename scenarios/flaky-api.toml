@@ -1,0 +1,52 @@
+# An API that mostly works.
+#
+# The useful failure mode is not "down" — everything handles down. It is a
+# service that answers correctly four times out of five and then does not, with
+# latency that varies enough that a fixed timeout is sometimes right and
+# sometimes not. That is what breaks retry logic, circuit breakers, and every
+# `await` someone forgot to bound.
+#
+# Faults are per-rule independent coins (see `FaultSpec::rate`), so the two
+# rules below compose: a request can be slow, or failed, or both.
+
+name = "flaky-api"
+description = "One request in five fails; latency varies from 50ms to 1.5s."
+
+blast_radius = """
+Data plane only, and only the /api/* routes. /_admin stays outside the fault \
+layer by design, so recovery is always `POST /_admin/reset` — you cannot lock \
+yourself out with this. No writes to Postgres, Redis or Mailpit beyond what \
+the caller makes; telemetry is honest.
+"""
+
+[[faults]]
+# Latency on nearly everything, with wide jitter. Deliberately not on every
+# request: a client that always sees 800ms adapts to it, and the bug being
+# hunted is the one that appears when the same endpoint is sometimes fast.
+route = "/api/*"
+rate = 0.8
+latency_ms = 50
+jitter_ms = 1450
+
+[[faults]]
+# 503 rather than a connection drop: a status a load balancer would produce,
+# which is what a client's retry policy is usually written against.
+route = "/api/*"
+rate = 0.2
+status = 503
+
+[[faults]]
+# Occasionally cut the body short *without* correcting content-length, so the
+# client sees a short read rather than a valid small response. This is the one
+# that finds JSON parsers assumed to be infallible.
+route = "/api/items"
+rate = 0.05
+truncate_body_at = 40
+
+webhooks = []
+
+[telemetry]
+# Honest telemetry, deliberately. The point of this scenario is that the
+# *service* is unreliable while the traces explaining it are trustworthy — pair
+# it with `broken-traces` only when you want both problems at once.
+rate = 0.0

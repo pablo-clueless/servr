@@ -16,7 +16,7 @@
 //!
 //! # Still owed
 //!
-//! `/_admin/snapshot` (Phase 9).
+//! Nothing. Every phase's control-plane surface is here.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -52,6 +52,7 @@ pub fn router(state: Shared) -> Router {
             get(list_faults).post(add_fault).delete(clear_faults),
         )
         .route("/_admin/events", get(events))
+        .route("/_admin/snapshot", get(read_snapshot).post(write_snapshot))
         .route(
             "/_admin/telemetry/faults",
             get(telemetry_faults)
@@ -591,6 +592,72 @@ async fn freeze(State(state): State<Shared>) -> Json<Value> {
 async fn resume(State(state): State<Shared>) -> Json<Value> {
     state.clock().resume();
     Json(json!({ "ok": true, "now": state.clock().now(), "frozen": false }))
+}
+
+/// Where `POST /_admin/snapshot` writes when the caller names no path.
+pub const DEFAULT_SNAPSHOT: &str = "testbed-snapshot.sqlite";
+
+#[derive(Deserialize)]
+struct SnapshotRequest {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Phase 9 gate: writes control-plane state to SQLite.
+///
+/// The data plane is explicitly not written — see `core::snapshot` for why
+/// that is a design constraint rather than a missing feature. This route
+/// therefore touches no Postgres, which is also why it lives on the plain admin
+/// router rather than alongside `/_admin/runs`.
+async fn write_snapshot(
+    State(state): State<Shared>,
+    Lenient(body): Lenient<SnapshotRequest>,
+) -> Result<Json<Value>, SnapshotApiError> {
+    let path = body.path.unwrap_or_else(|| DEFAULT_SNAPSHOT.to_string());
+    let snapshot = testbed_core::Snapshot::capture(&state);
+    snapshot.write(&path)?;
+
+    tracing::info!(%path, run = %snapshot.run, "control plane snapshotted");
+    Ok(Json(json!({
+        "ok": true,
+        "path": path,
+        "run": snapshot.run.to_string(),
+        "clock_offset_ms": snapshot.clock_offset_ms,
+        "restore_with": format!("testbed --restore {path}"),
+    })))
+}
+
+/// Reads a snapshot back without applying it.
+///
+/// Restoring happens at boot (`--restore`), never here: swapping the control
+/// plane under a running server would leave every in-flight request, queued
+/// job and open connection referring to a run that no longer matches the
+/// state, and `reset` is already the in-process way back to a known state.
+async fn read_snapshot(
+    axum::extract::Query(params): axum::extract::Query<SnapshotRequest>,
+) -> Result<Json<Value>, SnapshotApiError> {
+    let path = params.path.unwrap_or_else(|| DEFAULT_SNAPSHOT.to_string());
+    let snapshot = testbed_core::Snapshot::read(&path)?;
+    Ok(Json(serde_json::to_value(&snapshot).unwrap_or(Value::Null)))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct SnapshotApiError(#[from] testbed_core::SnapshotError);
+
+impl axum::response::IntoResponse for SnapshotApiError {
+    fn into_response(self) -> axum::response::Response {
+        use testbed_core::SnapshotError;
+
+        let status = match &self.0 {
+            SnapshotError::Missing(_) | SnapshotError::Empty(_) => {
+                axum::http::StatusCode::NOT_FOUND
+            }
+            SnapshotError::Version { .. } => axum::http::StatusCode::CONFLICT,
+            _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.0.to_string() }))).into_response()
+    }
 }
 
 /// Phase 8: the corruption the exporter shim applies.
