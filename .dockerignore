@@ -1,0 +1,49 @@
+# The Dockerfile does `COPY . .`, so anything not excluded here is uploaded as
+# build context and lands in the builder layer.
+#
+# Two things this is load-bearing for:
+#
+#   1. `target/` is tens of gigabytes after a few builds. Without this line a
+#      remote build (Render, CI) spends its whole time budget uploading object
+#      files it is about to overwrite, and may not finish at all.
+#   2. `.env` holds real credentials. The final image is a separate stage that
+#      copies only the binary and `scenarios/`, so nothing leaks into what ships
+#      — but the *builder* layer would still contain it, and builder layers are
+#      cached and often pushed.
+
+# Build output — regenerated inside the image, never wanted from the host.
+target/
+**/*.rs.bk
+
+# Credentials and local overrides.
+.env
+.env.*
+!env.example
+
+# Version control and editor state.
+.git/
+.gitignore
+.vscode/
+.qodo/
+
+# Local infrastructure. The image runs against whatever the platform provides;
+# compose is for the host.
+compose.yaml
+.devcontainer/
+deploy/
+.github/
+
+# Logs and scratch files from local runs.
+*.log
+*.sqlite
+
+# Documentation. HANDOFF.md is gitignored anyway; nothing in the build reads it.
+HANDOFF.md
+CHANGELOG.md
+README.md
+
+# NOT excluded, and must stay that way:
+#   Cargo.toml, Cargo.lock, crates/, server/  — the build itself
+#   migrations/                               — `include_str!`d by crates/http
+#   scenarios/                                — copied into the final image and
+#                                               read at boot via TESTBED_SCENARIO

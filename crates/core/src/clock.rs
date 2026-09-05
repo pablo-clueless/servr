@@ -55,6 +55,20 @@ impl Clock {
         clock
     }
 
+    /// Rebuilds a clock carrying `offset_ms`, frozen or not, for a restored
+    /// snapshot (HANDOFF §7 phase 9).
+    ///
+    /// The offset is reproduced, not the absolute virtual time the snapshot was
+    /// taken at — see `Snapshot::restore_clock` for why.
+    pub fn restore(offset_ms: i64, frozen: bool) -> Self {
+        let clock = Self::new();
+        clock.offset_ms.store(offset_ms, Ordering::SeqCst);
+        if frozen {
+            clock.freeze();
+        }
+        clock
+    }
+
     /// Current virtual time. Every scheduling decision in the testbed compares
     /// against this and never against wall time.
     pub fn now(&self) -> DateTime<Utc> {

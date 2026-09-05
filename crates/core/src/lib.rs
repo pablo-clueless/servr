@@ -13,6 +13,7 @@ pub mod config;
 pub mod event;
 pub mod fault;
 pub mod run;
+pub mod snapshot;
 pub mod state;
 pub mod trace;
 
@@ -22,5 +23,6 @@ pub use config::{Overlay, Resolved, Scenario};
 pub use event::{ConnId, Dir, Event, EventKind, JobId, JobState, StreamId};
 pub use fault::{FaultSpec, SigningScheme, TelemetryFault, WebhookEndpoint};
 pub use run::{RunId, RUN_HEADER};
+pub use snapshot::{Snapshot, SnapshotError};
 pub use state::State;
 pub use trace::{SpanId, TraceId};

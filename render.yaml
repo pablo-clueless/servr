@@ -1,0 +1,130 @@
+# Render blueprint for the testbed.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ READ THIS BEFORE APPLYING                                                │
+# │                                                                          │
+# │ `/_admin` has no authentication, by design (HANDOFF §10: "not a          │
+# │ production server, no auth hardening"). Deployed as a `web` service it   │
+# │ is on the public internet, and anyone who finds the URL can:             │
+# │                                                                          │
+# │   • POST /_admin/hooks/out with any URL — the server will sign and send  │
+# │     a request to it from inside your Render private network. That is an  │
+# │     SSRF primitive pointed at your own infrastructure.                   │
+# │   • DELETE /_admin/runs/{id} — drops Postgres schemas.                   │
+# │   • POST /_admin/telemetry/faults with cardinality_bomb — 50,000 fresh   │
+# │     series per scrape at whatever is scraping it.                        │
+# │   • POST /_admin/faults — make every response fail, indefinitely.        │
+# │                                                                          │
+# │ Render has no built-in auth for web services. If this instance is not    │
+# │ meant to be world-reachable, change `type: web` to `type: pserv` below   │
+# │ (private service, reachable only from your other Render services), or    │
+# │ front it with Cloudflare Access or equivalent. Deploying it public is a  │
+# │ legitimate choice for a throwaway testbed — just an explicit one.        │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Apply with: Render Dashboard → Blueprints → New Blueprint Instance.
+
+services:
+  - type: web
+    name: servr
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    healthCheckPath: /_admin/health
+
+    # MUST stay 1. The control plane — fault config, clock offset, ws presence,
+    # webhook queue, capture inbox — is in-process behind `ArcSwap`, and the
+    # event bus is an in-process `tokio::sync::broadcast` (Q1: single-replica,
+    # with an `EventSink` trait as the escape hatch if that ever changes).
+    #
+    # With two instances a client would hit whichever replica the load balancer
+    # picked: faults set on one would not apply on the other, `/_admin/events`
+    # would show half the traffic, and `clock/advance` would move one clock.
+    # Nothing would error — it would just be quietly, intermittently wrong,
+    # which is the worst possible failure mode for a testbed.
+    numInstances: 1
+
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: servr-db
+          property: connectionString
+
+      - key: REDIS_URL
+        fromService:
+          # Render renamed Redis to "Key Value"; if your account rejects
+          # `type: redis`, change both this and the service below to
+          # `type: keyvalue`. Nothing else moves.
+          type: redis
+          name: servr-redis
+          property: connectionString
+
+      # The server reads TESTBED_PORT first and falls back to Render's PORT, so
+      # this is belt-and-braces rather than required.
+      - key: TESTBED_PORT
+        value: "10000"
+
+      # Inert baseline: no faults, honest telemetry. Every other scenario in
+      # scenarios/ deliberately breaks something — read its `blast_radius`
+      # before setting this to one of them, and note that `cardinality-bomb`
+      # will degrade whatever scrapes /metrics.
+      - key: TESTBED_SCENARIO
+        value: scenarios/default.toml
+
+      - key: RUST_LOG
+        value: info,testbed=debug
+
+      # No OTLP collector in this blueprint. The server treats an unreachable
+      # collector as non-fatal — it logs a warning and skips export — so traces
+      # are simply not emitted. Point this at a collector (Grafana Cloud,
+      # Honeycomb, a private service) to turn them on.
+      # - key: OTEL_EXPORTER_OTLP_ENDPOINT
+      #   sync: false
+
+      # Mailpit is deliberately absent; see the note at the bottom of this file.
+      # Without it, /_admin/mail answers 503 and every other surface is
+      # unaffected.
+
+  - type: redis
+    name: servr-redis
+    plan: starter
+    region: oregon
+    # Empty allowlist = reachable only from inside your Render network. Do not
+    # open this: the queue is the testbed's own storage, not a shared cache.
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+
+databases:
+  - name: servr-db
+    databaseName: servr
+    user: servr
+    plan: basic-256mb
+    region: oregon
+
+# ---------------------------------------------------------------------------
+# What is not here, and why
+#
+# Mailpit (Phase 6). It needs two ports — 1025 for SMTP and 8025 for the REST
+# API — and a Render service routes exactly one. SMTP on 1025 would not be
+# reachable, so mail would fail in a way that looks like working isolation,
+# which is the exact failure T7 warns about. Options: run Mailpit somewhere
+# that can expose both ports and set MAILPIT_SMTP / MAILPIT_API at it, or leave
+# it unset and accept 503 on /_admin/mail.
+#
+# The obs stack (collector, Jaeger, Prometheus). Same shape of problem, and it
+# is behind a compose profile locally for a reason — `cardinality_bomb` is
+# designed to hurt whatever scrapes it. Point OTEL_EXPORTER_OTLP_ENDPOINT at a
+# collector you are willing to break.
+#
+# A disk for snapshots. `POST /_admin/snapshot` writes a SQLite file to the
+# container filesystem, which Render replaces on every deploy and restart. If
+# snapshots need to outlive a deploy, add:
+#
+#   disk:
+#     name: servr-snapshots
+#     mountPath: /data
+#     sizeGB: 1
+#
+# and snapshot to /data/... . Note that a disk pins the service to one instance
+# — which this blueprint already requires anyway.
