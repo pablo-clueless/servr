@@ -50,6 +50,49 @@ pub fn otlp_endpoint() -> String {
         .unwrap_or_else(|_| "http://localhost:4317".to_string())
 }
 
+/// Auth headers for the collector, from `OTEL_EXPORTER_OTLP_HEADERS`.
+///
+/// Every hosted OTLP backend authenticates: Grafana Cloud takes
+/// `Authorization=Basic <base64 instance:token>`, Honeycomb takes
+/// `x-honeycomb-team=<key>`, Dash0 takes a bearer token. Without this the
+/// exporter can reach them and is rejected, which surfaces as the same endless
+/// export error as not reaching them at all.
+///
+/// The format is the OpenTelemetry specification's: comma-separated
+/// `key=value`, values may contain `=` (base64 padding does), so the split is
+/// on the *first* one only.
+fn otlp_headers() -> tonic::metadata::MetadataMap {
+    use tonic::metadata::{MetadataKey, MetadataValue};
+
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    let Ok(raw) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") else {
+        return metadata;
+    };
+
+    for pair in raw.split(',') {
+        let Some((key, value)) = pair.split_once('=') else {
+            tracing::warn!(
+                "ignoring malformed OTEL_EXPORTER_OTLP_HEADERS entry {:?}; expected key=value",
+                pair
+            );
+            continue;
+        };
+
+        match (
+            MetadataKey::from_bytes(key.trim().to_ascii_lowercase().as_bytes()),
+            MetadataValue::try_from(value.trim()),
+        ) {
+            (Ok(k), Ok(v)) => {
+                metadata.insert(k, v);
+            }
+            // Never log the value: these are credentials.
+            _ => tracing::warn!("ignoring unusable OTLP header {:?}", key.trim()),
+        }
+    }
+
+    metadata
+}
+
 /// Whether anything is listening at `endpoint`.
 ///
 /// A plain TCP connect, not a gRPC handshake: the question is only "is this an
@@ -59,10 +102,28 @@ pub fn otlp_endpoint() -> String {
 fn collector_reachable(endpoint: &str) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
 
+    let secure = endpoint.starts_with("https://");
     let authority = endpoint
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');
+
+    // A hosted endpoint is usually written without a port —
+    // `https://otlp-gateway-prod-us-east-0.grafana.net` — and `to_socket_addrs`
+    // cannot resolve a bare host. Inferring it from the scheme is what tonic
+    // does, and getting this wrong would disable export against a collector
+    // that is perfectly reachable.
+    let authority = if authority
+        .rsplit(':')
+        .next()
+        .is_some_and(|p| p.parse::<u16>().is_ok())
+    {
+        authority.to_string()
+    } else if secure {
+        format!("{authority}:443")
+    } else {
+        format!("{authority}:80")
+    };
 
     // `to_socket_addrs` performs the DNS lookup; a name that does not resolve
     // is as unreachable as a port nothing is listening on.
@@ -191,30 +252,46 @@ fn build_provider(
 
     let endpoint = otlp_endpoint();
 
-    // An endpoint the operator set explicitly is trusted: they said where the
-    // collector is, and it may legitimately come up after the testbed does.
-    // The *default* is a different matter — nothing chose `localhost:4317`, it
-    // is just what `compose --profile obs` publishes, and on any host without
-    // that stack it is certainly wrong. Probing only the default keeps a
-    // deliberate configuration working while stopping the accidental one from
-    // logging an ERROR every five seconds forever.
+    // Probed whether the endpoint was configured or defaulted.
     //
-    // Same shape as the Postgres, Redis and Mailpit probes: check, degrade,
-    // and say so. Telemetry was the one optional dependency that reported
+    // An earlier version trusted an explicitly-set endpoint on the grounds that
+    // the operator had said where the collector was. That reasoning does not
+    // survive contact with a real deployment: the most common wrong value is a
+    // *stale* one — `127.0.0.1:4317` copied from a local `.env` into a hosted
+    // environment — and trusting it produced exactly the failure the probe
+    // exists to prevent, an ERROR every five seconds forever.
+    //
+    // The case this gives up is a collector that starts *after* the testbed.
+    // That is rarer than stale config, recoverable by a restart, and does not
+    // arise in this repo's own workflow: `make up-obs` uses `--wait`, so the
+    // collector is healthy before the server runs.
+    //
+    // Same shape as the Postgres, Redis and Mailpit probes: check, degrade, and
+    // say so. Telemetry was the one optional dependency that reported
     // `exporting=true` without ever looking.
-    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() && !collector_reachable(&endpoint) {
+    if !collector_reachable(&endpoint) {
         tracing::warn!(
             %endpoint,
-            "no collector at the default endpoint; span export disabled. Run              `docker compose --profile obs up -d`, or set              OTEL_EXPORTER_OTLP_ENDPOINT to a real collector. Metrics and              /_admin/events are unaffected."
+            "no collector reachable; span export disabled. Unset              OTEL_EXPORTER_OTLP_ENDPOINT to silence this, or point it at a real              collector. Metrics and /_admin/events are unaffected."
         );
         return None;
     }
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(&endpoint)
-        .with_timeout(Duration::from_secs(3))
-        .build();
+    let headers = otlp_headers();
+    if !headers.is_empty() {
+        tracing::debug!(count = headers.len(), "OTLP auth headers configured");
+    }
+
+    let exporter = {
+        use opentelemetry_otlp::WithTonicConfig;
+
+        opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint)
+            .with_timeout(Duration::from_secs(3))
+            .with_metadata(headers)
+            .build()
+    };
 
     match exporter {
         Ok(exporter) => Some(
@@ -305,6 +382,59 @@ pub mod late {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hosted collector is written without a port; inferring it wrongly would
+    /// disable export against a collector that is perfectly reachable.
+    #[test]
+    fn a_bare_https_host_probes_port_443_not_nothing() {
+        // Resolvable and listening on 443. If this ever fails for network
+        // reasons it fails loudly rather than silently asserting nothing.
+        assert!(
+            collector_reachable("https://example.com"),
+            "a bare https host was treated as unreachable; check the port inference"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_with_nothing_listening_is_unreachable() {
+        // Port 1 on loopback: reserved, never bound.
+        assert!(!collector_reachable("http://127.0.0.1:1"));
+    }
+
+    #[test]
+    fn a_hostname_that_does_not_resolve_is_unreachable() {
+        assert!(!collector_reachable(
+            "http://collector.invalid.testbed.example:4317"
+        ));
+    }
+
+    #[test]
+    fn otlp_headers_parse_the_spec_format() {
+        // Base64 values contain `=`, so only the first one separates.
+        std::env::set_var(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "Authorization=Basic dXNlcjpwYXNz==,x-scope-orgid=tenant1",
+        );
+        let headers = otlp_headers();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS");
+
+        assert_eq!(headers.len(), 2);
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Basic dXNlcjpwYXNz=="
+        );
+        assert_eq!(headers.get("x-scope-orgid").unwrap(), "tenant1");
+    }
+
+    #[test]
+    fn malformed_header_entries_are_skipped_not_fatal() {
+        std::env::set_var("OTEL_EXPORTER_OTLP_HEADERS", "novalue,good=yes");
+        let headers = otlp_headers();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get("good").unwrap(), "yes");
+    }
 
     #[test]
     fn otlp_endpoint_falls_back_to_the_compose_collector() {

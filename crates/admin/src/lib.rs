@@ -62,6 +62,103 @@ pub fn router(state: Shared) -> Router {
         .with_state(state)
 }
 
+/// What `server` actually managed to wire up, for [`index`].
+///
+/// Every one of these is optional at boot and degrades rather than failing, so
+/// "is Postgres connected" is a question only the process that did the wiring
+/// can answer — the control plane deliberately never touches it (invariant 3).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Surfaces {
+    pub postgres: bool,
+    pub redis: bool,
+    pub mailpit: bool,
+    pub tracing: bool,
+}
+
+/// `GET /` — what this is, whether it is healthy, and what can be called.
+///
+/// # Why this exists
+///
+/// A deployed testbed with nothing at the root is hostile: the first thing
+/// anyone does with a URL is open it, and a 404 there says "broken" when the
+/// service is fine. This is the boot log made queryable — the same
+/// degradation status, from a machine you can curl instead of a log you have
+/// to still have open.
+///
+/// # Why it is not behind the fault layer
+///
+/// Same reason `/_admin` is not (see [`crate`] docs): a scenario matching `/*`
+/// would make the one page that explains what is happening fail along with
+/// everything else, exactly when it is most wanted.
+///
+/// This is not the UI §10 defers — no HTML, no assets, no state. It is a route
+/// listing. The UI, when it happens, consumes `/_admin/events`.
+pub fn index_router(state: Shared, surfaces: Surfaces) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .with_state((state, surfaces))
+}
+
+async fn index(State((state, surfaces)): State<(Shared, Surfaces)>) -> Json<Value> {
+    Json(json!({
+        "name": "servr",
+        "description": "A fault-injection testbed. Every surface can be told to misbehave on demand.",
+        "run": state.run().to_string(),
+        "scenario": state.base().name,
+        "blast_radius": state.base().blast_radius,
+
+        // The optional dependencies, as wired at boot. `false` is not an error
+        // — the matching surface answers 503 or falls back, and the boot log
+        // says which.
+        "connected": surfaces,
+
+        "surfaces": {
+            "http":      ["GET /api/ping", "POST /api/echo", "GET|POST /api/items", "GET|DELETE /api/items/{id}"],
+            "websocket": ["GET /ws?topic={topic}"],
+            "streaming": ["POST /v1/chat/completions", "GET /_stream/{id}"],
+            "webhooks":  ["POST /hooks/in/{id}"],
+            "metrics":   ["GET /metrics"],
+        },
+        "control_plane": {
+            "health":    ["GET /_admin/health", "POST /_admin/reset"],
+            "clock":     ["GET /_admin/clock", "POST /_admin/clock/advance", "POST /_admin/clock/freeze", "POST /_admin/clock/resume"],
+            "faults":    ["GET|POST|DELETE /_admin/faults"],
+            "events":    ["GET /_admin/events (SSE)"],
+            "runs":      ["GET|POST /_admin/runs", "DELETE /_admin/runs/{id}"],
+            "jobs":      ["GET|POST /_admin/jobs", "GET /_admin/jobs/{id}"],
+            "websocket": ["GET /_admin/ws", "POST /_admin/ws/publish", "POST /_admin/ws/kill"],
+            "mail":      ["GET|DELETE /_admin/mail", "POST /_admin/mail/send"],
+            "webhooks":  ["GET /_admin/hooks/in", "GET|DELETE /_admin/hooks/in/{id}", "GET|POST /_admin/hooks/out"],
+            "telemetry": ["GET|POST|DELETE /_admin/telemetry/faults"],
+            "snapshot":  ["GET|POST /_admin/snapshot"],
+        },
+
+        // Said plainly rather than left to be discovered.
+        "warning": "/_admin is unauthenticated. Anyone who can reach this URL can inject faults,                     drop run schemas, and make this server send signed requests to any URL.",
+    }))
+}
+
+/// The catch-all for a path no router claimed.
+///
+/// axum's default 404 has an **empty body**, so a browser shows its own "page
+/// cannot be found" and a client gets a status with nothing to act on — both
+/// of which read as "the server is broken" rather than "that route does not
+/// exist". Every other error this service produces is JSON with an `error`
+/// key; this makes the most common one match.
+///
+/// Wired with `Router::fallback` on the assembled app, so it sees only paths
+/// that matched nothing. A known path with the wrong method still gets axum's
+/// 405, which is the more accurate answer and should not be swallowed here.
+pub async fn not_found(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": format!("no route for {}", uri.path()),
+            "hint": "GET / lists every surface on this testbed",
+        })),
+    )
+}
+
 /// Run lifecycle. Separate from [`router`] because it is the only part of the
 /// control plane that reaches the data plane — to create and drop schemas — and
 /// keeping that dependency off the main admin state makes the boundary visible.
@@ -302,10 +399,15 @@ async fn mail_list(
     let limit = params.limit.unwrap_or(testbed_mail::inbox::DEFAULT_LIMIT);
     let query = params.query.as_deref();
 
+    // Relay mode has no inbox — say so rather than serving an empty list,
+    // which would read as "your run sent nothing" and is the one answer a mail
+    // assertion must never get wrong (T7's failure mode, one layer up).
+    let inbox = mailer.inbox().ok_or(testbed_mail::MailError::NoInbox)?;
+
     let messages = if params.all {
-        mailer.inbox().all(query, limit).await?
+        inbox.all(query, limit).await?
     } else {
-        mailer.inbox().for_run(run, query, limit).await?
+        inbox.for_run(run, query, limit).await?
     };
 
     Ok(Json(json!({
@@ -324,7 +426,8 @@ async fn mail_purge(
     State((mailer, _)): State<(MaybeMailer, Shared)>,
 ) -> Result<Json<Value>, MailApiError> {
     let mailer = mailer.as_ref().ok_or(MailApiError::Unconfigured)?;
-    mailer.inbox().purge().await?;
+    let inbox = mailer.inbox().ok_or(testbed_mail::MailError::NoInbox)?;
+    inbox.purge().await?;
     Ok(Json(json!({ "ok": true, "scope": "all runs" })))
 }
 
@@ -340,9 +443,16 @@ enum MailApiError {
 
 impl axum::response::IntoResponse for MailApiError {
     fn into_response(self) -> axum::response::Response {
+        use testbed_mail::MailError;
+
         let status = match &self {
             Self::Unconfigured => axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Self::BadRun(_) => axum::http::StatusCode::BAD_REQUEST,
+            // Refused on purpose, by policy — not a server fault and not
+            // retryable, so 403 rather than 502.
+            Self::Mail(MailError::RecipientNotAllowed { .. }) => axum::http::StatusCode::FORBIDDEN,
+            // The surface exists but this transport cannot provide it.
+            Self::Mail(MailError::NoInbox) => axum::http::StatusCode::NOT_IMPLEMENTED,
             // A send that fails because Mailpit went away is not the caller's
             // fault, and 502 says so more usefully than 500.
             Self::Mail(_) => axum::http::StatusCode::BAD_GATEWAY,
