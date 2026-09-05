@@ -50,6 +50,29 @@ pub fn otlp_endpoint() -> String {
         .unwrap_or_else(|_| "http://localhost:4317".to_string())
 }
 
+/// Whether anything is listening at `endpoint`.
+///
+/// A plain TCP connect, not a gRPC handshake: the question is only "is this an
+/// address where a collector could be", and a refused connection answers it.
+/// Deliberately short — this runs on the boot path, and a slow DNS lookup for a
+/// misconfigured host should not hold the server down.
+fn collector_reachable(endpoint: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let authority = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+
+    // `to_socket_addrs` performs the DNS lookup; a name that does not resolve
+    // is as unreachable as a port nothing is listening on.
+    let Ok(mut addrs) = authority.to_socket_addrs() else {
+        return false;
+    };
+
+    addrs.any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok())
+}
+
 /// Whether span export is switched off entirely.
 ///
 /// # Why this exists
@@ -167,6 +190,26 @@ fn build_provider(
     }
 
     let endpoint = otlp_endpoint();
+
+    // An endpoint the operator set explicitly is trusted: they said where the
+    // collector is, and it may legitimately come up after the testbed does.
+    // The *default* is a different matter — nothing chose `localhost:4317`, it
+    // is just what `compose --profile obs` publishes, and on any host without
+    // that stack it is certainly wrong. Probing only the default keeps a
+    // deliberate configuration working while stopping the accidental one from
+    // logging an ERROR every five seconds forever.
+    //
+    // Same shape as the Postgres, Redis and Mailpit probes: check, degrade,
+    // and say so. Telemetry was the one optional dependency that reported
+    // `exporting=true` without ever looking.
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() && !collector_reachable(&endpoint) {
+        tracing::warn!(
+            %endpoint,
+            "no collector at the default endpoint; span export disabled. Run              `docker compose --profile obs up -d`, or set              OTEL_EXPORTER_OTLP_ENDPOINT to a real collector. Metrics and              /_admin/events are unaffected."
+        );
+        return None;
+    }
+
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(&endpoint)
