@@ -50,6 +50,31 @@ pub fn otlp_endpoint() -> String {
         .unwrap_or_else(|_| "http://localhost:4317".to_string())
 }
 
+/// Whether span export is switched off entirely.
+///
+/// # Why this exists
+///
+/// Building the OTLP exporter succeeds without connecting to anything, so a
+/// deployment with no collector boots reporting `exporting=true` and then logs
+/// a `BatchSpanProcessor.ExportError` at ERROR level every five seconds,
+/// forever. On a hosted platform that is the entire log — the one place an
+/// operator looks to find out what the testbed is doing.
+///
+/// The default endpoint is `localhost:4317`, which is right for
+/// `compose --profile obs` and wrong for everywhere else, so "no collector" has
+/// to be sayable. `OTEL_SDK_DISABLED` is the OpenTelemetry specification's own
+/// switch for it; an explicitly empty `OTEL_EXPORTER_OTLP_ENDPOINT` is accepted
+/// too, because setting a variable to nothing is the obvious way to express
+/// this and silently falling back to localhost would be a trap.
+pub fn export_disabled() -> bool {
+    if let Ok(flag) = std::env::var("OTEL_SDK_DISABLED") {
+        if matches!(flag.trim().to_ascii_lowercase().as_str(), "true" | "1") {
+            return true;
+        }
+    }
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok_and(|e| e.trim().is_empty())
+}
+
 /// Live telemetry. Hold it for the process lifetime and call
 /// [`Telemetry::shutdown`] on the way out.
 pub struct Telemetry {
@@ -133,6 +158,13 @@ fn build_provider(
     faults: Arc<dyn chaos::Faults>,
 ) -> Option<SdkTracerProvider> {
     use opentelemetry_otlp::WithExportConfig;
+
+    if export_disabled() {
+        tracing::info!(
+            "span export disabled (OTEL_SDK_DISABLED); metrics and /_admin/events are unaffected"
+        );
+        return None;
+    }
 
     let endpoint = otlp_endpoint();
     let exporter = opentelemetry_otlp::SpanExporter::builder()
