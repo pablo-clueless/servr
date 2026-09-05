@@ -102,6 +102,46 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
+    /// Every shipped scenario must load through the real deserializer.
+    ///
+    /// `toml::from_str` succeeding is not the same thing: a file can be valid
+    /// TOML and still name a field `Scenario` does not have, or give one the
+    /// wrong type. Without this the first sign of a typo is a server that
+    /// refuses to boot — and since a scenario is chosen by env var, usually on
+    /// someone else's machine.
+    #[test]
+    fn every_shipped_scenario_deserializes() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scenarios")
+            .canonicalize()
+            .expect("scenarios/ is missing");
+
+        let mut loaded = 0;
+        for entry in std::fs::read_dir(&dir).expect("scenarios/ is unreadable") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+
+            let scenario = Scenario::from_path(&path)
+                .unwrap_or_else(|e| panic!("{} does not load: {e}", path.display()));
+
+            assert!(
+                !scenario.name.is_empty(),
+                "{} has no name; --scenario selects on it",
+                path.display()
+            );
+            assert!(
+                scenario.blast_radius.is_some(),
+                "{} declares no blast radius — required in spirit for anything                  that touches something outside the testbed (HANDOFF §6)",
+                path.display()
+            );
+            loaded += 1;
+        }
+
+        assert!(loaded >= 5, "only {loaded} scenarios found in {dir:?}");
+    }
+
     #[test]
     fn the_shipped_default_scenario_parses() {
         let src = include_str!("../../../scenarios/default.toml");

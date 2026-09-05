@@ -53,6 +53,11 @@ proptest = "1"
 # Already compiled in via opentelemetry-http, so this costs no new tree. Reads
 # Mailpit's REST API now; Phase 7 sends outbound webhooks through it.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# SQLite for control-plane snapshots (decision 3). Deliberately NOT sqlx:
+# invariant 3's grep uses `sqlx` as the marker for Postgres I/O, and keeping the
+# two bindings distinct keeps that gate precise. `bundled` so no system SQLite
+# is required.
+rusqlite = { version = "0.37", features = ["bundled"] }
 redis = { version = "1.6", features = ["tokio-comp", "script", "connection-manager"] }
 rand = "0.9"
 socket2 = "0.6"

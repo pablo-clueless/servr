@@ -1,0 +1,70 @@
+# Outbound webhooks that keep failing and keep retrying.
+#
+# The receiver here is the testbed's own capture inbox, and the fault below
+# makes it reject most deliveries — so every queued delivery climbs its retry
+# ladder, and the ladders overlap. What this exercises is a consumer's
+# idempotency: the same delivery arrives more than once, signed correctly each
+# time, with a `traceparent` that differs per attempt because each attempt is
+# its own trace linked back to the enqueue (T10).
+#
+# Retry offsets are virtual (see `hooks::outbound`), so the storm is compressed
+# into whatever you advance the clock by rather than into real minutes:
+#
+#   for i in $(seq 50); do
+#     curl -s -X POST localhost:8080/_admin/hooks/out \
+#       -d '{"name":"storm","url":"http://localhost:8080/hooks/in/storm"}' >/dev/null
+#   done
+#   curl -s -X POST localhost:8080/_admin/clock/advance -d '{"ms":300000}'
+#
+# The endpoints below are seeded config; the deliveries themselves are still
+# queued through `/_admin/hooks/out`, because how many and how fast is the
+# variable you are testing with.
+
+name = "webhook-storm"
+description = "A failing receiver and short retry ladders; deliveries pile up and duplicate."
+
+blast_radius = """
+Outbound HTTP to whatever URL a delivery names. As seeded, that is the \
+testbed's own inbox on localhost — but `/_admin/hooks/out` accepts any URL, so \
+do not point a storm at a service you do not own. The capture inbox is bounded \
+at 500 per endpoint (oldest dropped), so a long storm will not exhaust memory. \
+The /hooks/in/* fault below is data-plane only; /_admin stays reachable, and \
+`POST /_admin/reset` clears it.
+"""
+
+[[faults]]
+# The receiver fails most of the time. Deliveries therefore retry for real —
+# unlike `fail_first`, which short-circuits before the request and so never
+# reaches the inbox at all. Duplicate delivery is the property under test, and
+# only a genuinely failing receiver produces it.
+route = "/hooks/in/*"
+rate = 0.7
+status = 500
+
+[[faults]]
+# A slow receiver as well as a failing one, so attempts overlap in flight
+# rather than arriving in a tidy sequence.
+route = "/hooks/in/*"
+rate = 0.3
+latency_ms = 200
+jitter_ms = 800
+
+# Named endpoints a scenario-aware harness can pick up. `backoff_ms` is
+# deliberately tight — the default ladder is 1s/5s/30s, and a storm wants the
+# attempts bunched so they interleave.
+[[webhooks]]
+name = "storm"
+url = "http://localhost:8080/hooks/in/storm"
+sign = "stripe"
+backoff_ms = [200, 400, 800, 1600]
+
+[[webhooks]]
+# The same traffic under the other signing scheme, so a consumer that
+# implements only one is exercised alongside one that implements both (Q4).
+name = "storm-github"
+url = "http://localhost:8080/hooks/in/storm"
+sign = "github"
+backoff_ms = [200, 400, 800, 1600]
+
+[telemetry]
+rate = 0.0
