@@ -19,16 +19,15 @@
 //! These live in `server` because it is the only crate permitted to depend on
 //! more than one surface (HANDOFF §4).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::SdkTracerProvider;
 use testbed_core::{BroadcastBus, Clock, EventKind, EventSink, RunId, Scenario, State};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
-use tracing_subscriber::layer::SubscriberExt;
 
 /// Every read is bounded. An unbounded `recv().await` on a close that never
 /// arrives is exactly the hang T6 describes, and a test that hangs reports
@@ -59,29 +58,9 @@ impl Server {
     }
 }
 
-/// Installs a process-wide tracer with no exporter: spans get real, valid ids
-/// and nothing leaves the process.
-///
-/// Global, not `with_default`, because the spans under test are opened on
-/// *other* tasks — the connection task and the admin handler's. A
-/// thread-scoped subscriber reaches neither, and the visible symptom is a bus
-/// event with no trace id, which reads as an invariant-9 violation rather than
-/// as a missing subscriber.
-fn install_tracing() {
-    static PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
-
-    let provider = PROVIDER.get_or_init(|| SdkTracerProvider::builder().build());
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ws-gate")));
-
-    // Every test in this binary shares the process, so all but the first call
-    // lose the race. That is fine — they wanted the same subscriber.
-    let _ = tracing::subscriber::set_global_default(subscriber);
-}
-
 /// Boots the real assembled router on an ephemeral port.
 async fn serve() -> Server {
-    install_tracing();
+    common::install_tracing();
 
     let run = RunId::new();
     let clock = Arc::new(Clock::new());

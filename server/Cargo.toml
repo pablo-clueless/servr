@@ -28,6 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+reqwest.workspace = true
 # A real WS client for the Phase 5 gate. Already in the lock via axum's `ws`
 # feature, so it costs nothing new — and T6 is only observable to a client that
 # inspects the close frame.
