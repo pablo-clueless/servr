@@ -30,6 +30,7 @@
 //! silently reading each other's mail and every mail assertion in every
 //! scenario becomes meaningless.
 
+pub mod allow;
 pub mod inbox;
 pub mod send;
 
@@ -37,6 +38,7 @@ use std::sync::Arc;
 
 use testbed_core::{Clock, EventSink};
 
+pub use allow::Allowlist;
 pub use inbox::{Inbox, Message};
 pub use send::{OutgoingMail, SentMail, RUN_HEADER_NAME};
 
@@ -45,13 +47,34 @@ pub const SMTP_PORT: u16 = 1025;
 /// Mailpit's HTTP/REST port in `compose.yaml`.
 pub const HTTP_PORT: u16 = 8025;
 
-/// Where Mailpit is.
+/// An authenticated SMTP relay — Brevo, SES, Postmark, anything real.
+///
+/// Its presence switches the transport from Mailpit's plaintext socket to
+/// STARTTLS with credentials, and switches the read side off: a relay accepts
+/// mail and tells you nothing about it afterwards.
+#[derive(Debug, Clone)]
+pub struct Relay {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    /// Envelope sender. Relays reject anything from an unverified address, so
+    /// this is required rather than defaulted to `testbed@localhost`.
+    pub from: String,
+}
+
+/// Where mail goes, and who it may go to.
 #[derive(Debug, Clone)]
 pub struct MailConfig {
-    /// `host:port` for SMTP.
+    /// `host:port` for Mailpit's plaintext SMTP.
     pub smtp: String,
-    /// Base URL for the REST API, no trailing slash.
+    /// Base URL for Mailpit's REST API, no trailing slash.
     pub api: String,
+    /// When set, mail is relayed for real instead of dropped into Mailpit.
+    pub relay: Option<Relay>,
+    /// Recipients a *relay* send may reach. Ignored in Mailpit mode, where
+    /// nothing leaves the machine.
+    pub allowed: Allowlist,
 }
 
 impl Default for MailConfig {
@@ -59,19 +82,62 @@ impl Default for MailConfig {
         Self {
             smtp: format!("localhost:{SMTP_PORT}"),
             api: format!("http://localhost:{HTTP_PORT}"),
+            relay: None,
+            allowed: Allowlist::default(),
         }
     }
 }
 
 impl MailConfig {
-    /// Reads `MAILPIT_SMTP` and `MAILPIT_API`, falling back to the ports
+    /// Reads `MAILPIT_SMTP` and the REST endpoint, falling back to the ports
     /// `compose.yaml` publishes.
+    ///
+    /// # Two names for the REST endpoint
+    ///
+    /// `MAILPIT_HTTP` is what `.env` and `compose.yaml` have always called it
+    /// (`MAILPIT_HTTP_PORT` publishes it); `MAILPIT_API` is what this crate
+    /// originally read, and what the Makefile and `render.yaml` document. Both
+    /// are accepted because the mismatch was a real, silent bug: a deployment
+    /// configured from `.env` set `MAILPIT_HTTP`, this read `MAILPIT_API`, got
+    /// nothing, fell back to `localhost:8025`, and reported Mailpit as
+    /// unreachable — with correct configuration sitting right there. The unit
+    /// tests missed it because they set `MAILPIT_API` explicitly.
     pub fn from_env() -> Self {
         let default = Self::default();
+
+        // `SMTP_HOST` is the switch. Its presence means a real relay was
+        // configured, and everything else about the mail surface follows from
+        // that — including that there is no inbox to read back.
+        let relay = std::env::var("SMTP_HOST").ok().map(|host| Relay {
+            host,
+            port: std::env::var("SMTP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                // 587 (submission, STARTTLS) rather than 25: every hosted relay
+                // uses it and outbound 25 is blocked on most platforms anyway.
+                .unwrap_or(587),
+            user: std::env::var("SMTP_USER").unwrap_or_default(),
+            password: std::env::var("SMTP_PASS").unwrap_or_default(),
+            from: std::env::var("MAIL_FROM")
+                .or_else(|_| std::env::var("SMTP_USER"))
+                .unwrap_or_else(|_| send::DEFAULT_FROM.to_string()),
+        });
+
         Self {
             smtp: std::env::var("MAILPIT_SMTP").unwrap_or(default.smtp),
-            api: std::env::var("MAILPIT_API").unwrap_or(default.api),
+            api: std::env::var("MAILPIT_API")
+                .or_else(|_| std::env::var("MAILPIT_HTTP"))
+                .unwrap_or(default.api),
+            relay,
+            allowed: Allowlist::parse(
+                &std::env::var("MAIL_ALLOWED_RECIPIENTS").unwrap_or_default(),
+            ),
         }
+    }
+
+    /// Whether mail actually leaves the machine.
+    pub fn is_relay(&self) -> bool {
+        self.relay.is_some()
     }
 
     /// Splits [`Self::smtp`] into host and port.
@@ -93,6 +159,7 @@ impl MailConfig {
 pub struct Mailer {
     sender: send::Sender,
     inbox: Inbox,
+    config: MailConfig,
     bus: Arc<dyn EventSink>,
     clock: Arc<Clock>,
     run: testbed_core::RunId,
@@ -113,19 +180,41 @@ impl Mailer {
         Ok(Self {
             sender: send::Sender::new(&config)?,
             inbox: Inbox::new(&config)?,
+            config,
             bus,
             clock,
             run,
         })
     }
 
-    /// Asks Mailpit for its version. Cheap liveness check for boot.
+    /// Liveness check for boot.
+    ///
+    /// In Mailpit mode this asks the REST API for its version. In relay mode
+    /// there is no REST API, so it opens the SMTP connection instead — which
+    /// also verifies the credentials and TLS, the two things most likely to be
+    /// wrong.
     pub async fn probe(&self) -> Result<String, MailError> {
-        self.inbox.version().await
+        match &self.config.relay {
+            Some(relay) => {
+                self.sender.test_connection().await?;
+                Ok(format!("relay {}:{}", relay.host, relay.port))
+            }
+            None => self.inbox.version().await,
+        }
     }
 
-    pub fn inbox(&self) -> &Inbox {
-        &self.inbox
+    /// The read side. `None` in relay mode: a relay accepts mail and tells you
+    /// nothing afterwards, so there is no inbox to filter by run.
+    pub fn inbox(&self) -> Option<&Inbox> {
+        if self.config.is_relay() {
+            None
+        } else {
+            Some(&self.inbox)
+        }
+    }
+
+    pub fn config(&self) -> &MailConfig {
+        &self.config
     }
 
     /// Sends `mail` tagged with `run`, then records it on both surfaces.
@@ -138,6 +227,16 @@ impl Mailer {
         run: testbed_core::RunId,
         mail: OutgoingMail,
     ) -> Result<SentMail, MailError> {
+        // The allowlist is checked here and nowhere else. `/_admin` is
+        // unauthenticated, so in relay mode this is the only thing standing
+        // between a public URL and an open mail relay — see `allow`.
+        if self.config.is_relay() && !self.config.allowed.permits(&mail.to) {
+            return Err(MailError::RecipientNotAllowed {
+                to: mail.to.clone(),
+                allowed: self.config.allowed.to_string(),
+            });
+        }
+
         let span = tracing::info_span!(
             "mail.send",
             otel.name = "mail send",
@@ -197,11 +296,122 @@ pub enum MailError {
     Api(String),
     #[error("Mailpit answered {status} for {path}")]
     Status { status: u16, path: String },
+    #[error(
+        "refusing to relay to {to}: not in MAIL_ALLOWED_RECIPIENTS ({allowed}).          This endpoint is unauthenticated; without the allowlist it is an open relay."
+    )]
+    RecipientNotAllowed { to: String, allowed: String },
+    #[error(
+        "this testbed relays mail and has no inbox; a relay accepts mail and reports nothing back"
+    )]
+    NoInbox,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc as StdArc;
+    use testbed_core::{BroadcastBus, RunId};
+
+    fn relay_config(allowed: &str) -> MailConfig {
+        MailConfig {
+            relay: Some(Relay {
+                host: "smtp.example.test".into(),
+                port: 587,
+                user: "user".into(),
+                password: "pass".into(),
+                from: "testbed@example.com".into(),
+            }),
+            allowed: Allowlist::parse(allowed),
+            ..Default::default()
+        }
+    }
+
+    fn mailer_with(config: MailConfig) -> Mailer {
+        let run = RunId::new();
+        let clock = StdArc::new(Clock::new());
+        let bus = StdArc::new(BroadcastBus::new(8, StdArc::clone(&clock), run));
+        Mailer::new(config, bus, clock, run).expect("client builds")
+    }
+
+    fn mail_to(to: &str) -> OutgoingMail {
+        serde_json::from_value(serde_json::json!({ "to": to, "subject": "x" })).unwrap()
+    }
+
+    /// The guard that stands between a public unauthenticated endpoint and an
+    /// open mail relay. It has to refuse *before* the transport is touched, so
+    /// this asserts on a host that does not resolve: reaching SMTP at all would
+    /// be a different error.
+    #[tokio::test]
+    async fn a_relay_refuses_a_recipient_outside_the_allowlist() {
+        let mailer = mailer_with(relay_config("@allowed.test"));
+
+        let err = mailer
+            .send(RunId::new(), mail_to("stranger@elsewhere.test"))
+            .await
+            .expect_err("an unlisted recipient was accepted");
+
+        assert!(
+            matches!(err, MailError::RecipientNotAllowed { .. }),
+            "refused for the wrong reason: {err}"
+        );
+        assert!(err.to_string().contains("open relay"));
+    }
+
+    /// Fails closed: a relay with no allowlist sends nothing at all.
+    #[tokio::test]
+    async fn a_relay_with_no_allowlist_refuses_everything() {
+        let mailer = mailer_with(relay_config(""));
+
+        let err = mailer
+            .send(RunId::new(), mail_to("anyone@anywhere.test"))
+            .await
+            .expect_err("an unconfigured relay sent mail");
+        assert!(matches!(err, MailError::RecipientNotAllowed { .. }));
+    }
+
+    /// Mailpit mode is unrestricted on purpose — nothing leaves the machine, so
+    /// an allowlist there would be ceremony with no safety value.
+    #[tokio::test]
+    async fn mailpit_mode_does_not_apply_the_allowlist() {
+        let mailer = mailer_with(MailConfig::default());
+        assert!(!mailer.config().is_relay());
+
+        // Deliberately tolerant of both outcomes: with Mailpit up this send
+        // succeeds, without it the transport errors. Neither is the point — the
+        // assertion is only that it was never refused by *policy*, which is the
+        // one result that would mean the guard had leaked into Mailpit mode.
+        match mailer
+            .send(RunId::new(), mail_to("anyone@anywhere.test"))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => assert!(
+                !matches!(e, MailError::RecipientNotAllowed { .. }),
+                "the allowlist was applied in Mailpit mode: {e}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relay_has_no_inbox_to_read() {
+        let mailer = mailer_with(relay_config("@allowed.test"));
+        assert!(
+            mailer.inbox().is_none(),
+            "relay mode offered an inbox; a relay reports nothing back"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailpit_mode_has_an_inbox() {
+        assert!(mailer_with(MailConfig::default()).inbox().is_some());
+    }
+
+    #[test]
+    fn smtp_host_switches_the_transport_and_nothing_else_does() {
+        assert!(!MailConfig::default().is_relay());
+        assert!(relay_config("@a.test").is_relay());
+    }
 
     #[test]
     fn smtp_parts_splits_host_and_port() {

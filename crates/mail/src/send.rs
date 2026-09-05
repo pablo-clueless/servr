@@ -70,22 +70,62 @@ pub struct SentMail {
 
 pub struct Sender {
     transport: AsyncSmtpTransport<Tokio1Executor>,
+    /// Envelope sender when the caller names none. A relay rejects mail from an
+    /// unverified address, so this is the relay's configured sender rather than
+    /// the Mailpit default.
+    default_from: String,
 }
 
 impl Sender {
     pub fn new(config: &MailConfig) -> Result<Self, MailError> {
-        let (host, port) = config.smtp_parts()?;
+        match &config.relay {
+            // A real relay: STARTTLS on submission, with credentials. Built
+            // with `starttls_relay` rather than `relay` because 587 begins in
+            // plaintext and upgrades, which is what every hosted provider
+            // expects; `relay` would attempt implicit TLS on 465 and hang.
+            Some(relay) => {
+                let mut builder = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&relay.host)
+                    .map_err(|e| MailError::Config(format!("relay {}: {e}", relay.host)))?
+                    .port(relay.port);
 
-        // `builder_dangerous` is the plaintext, no-TLS builder, and that is
-        // correct here: Mailpit in `compose.yaml` speaks plain SMTP on 1025 and
-        // the testbed never sends mail anywhere else. The workspace does not
-        // enable a TLS feature on lettre at all, so there is no encrypted path
-        // to fall back to and nothing to negotiate away.
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
-            .port(port)
-            .build();
+                if !relay.user.is_empty() {
+                    builder = builder.credentials(
+                        lettre::transport::smtp::authentication::Credentials::new(
+                            relay.user.clone(),
+                            relay.password.clone(),
+                        ),
+                    );
+                }
 
-        Ok(Self { transport })
+                Ok(Self {
+                    transport: builder.build(),
+                    default_from: relay.from.clone(),
+                })
+            }
+
+            // Mailpit: `builder_dangerous` is the plaintext, no-TLS builder,
+            // and that is correct — compose publishes plain SMTP on 1025, and
+            // nothing leaves the machine.
+            None => {
+                let (host, port) = config.smtp_parts()?;
+                Ok(Self {
+                    transport: AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
+                        .port(port)
+                        .build(),
+                    default_from: DEFAULT_FROM.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Opens the connection without sending, so a bad host, port, certificate
+    /// or credential is a boot-time error rather than a first-send surprise.
+    pub async fn test_connection(&self) -> Result<(), MailError> {
+        match self.transport.test_connection().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(MailError::Smtp("connection refused by the server".into())),
+            Err(e) => Err(MailError::Smtp(e.to_string())),
+        }
     }
 
     pub async fn send(&self, run: RunId, mail: &OutgoingMail) -> Result<SentMail, MailError> {
@@ -94,7 +134,7 @@ impl Sender {
         // the built message would work and would be one more thing to get
         // subtly wrong.
         let message_id = format!("{}@testbed", uuid::Uuid::new_v4());
-        let from = mail.from.as_deref().unwrap_or(DEFAULT_FROM);
+        let from = mail.from.as_deref().unwrap_or(&self.default_from);
 
         let built = Message::builder()
             .from(
