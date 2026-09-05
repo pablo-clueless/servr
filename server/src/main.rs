@@ -145,11 +145,13 @@ async fn main() {
 
     // The scheduler polls against the virtual clock either way; Redis only
     // changes where jobs live, and whether they survive a restart.
+    let mut redis_backed = false;
     let store: Arc<dyn testbed_queue::JobStore> = match std::env::var("REDIS_URL") {
         Ok(url) => {
             match testbed_queue::RedisStore::connect(&url, run).await {
                 Ok(store) => {
                     tracing::info!("queue backed by Redis");
+                    redis_backed = true;
                     Arc::new(store)
                 }
                 Err(e) => {
@@ -223,7 +225,17 @@ async fn main() {
     ));
     let streams = testbed_stream::Streams::new(Arc::clone(state.bus()), Arc::clone(&clock), run);
 
+    // What actually came up, for `GET /`. Read from the wiring above rather
+    // than re-probed, so the index cannot disagree with the boot log.
+    let surfaces = testbed_admin::Surfaces {
+        postgres: data.is_some(),
+        redis: redis_backed,
+        mailpit: mailer.is_some(),
+        tracing: telemetry.exporting(),
+    };
+
     let app = Router::new()
+        .merge(testbed_admin::index_router(Arc::clone(&state), surfaces))
         .merge(testbed_admin::router(Arc::clone(&state)))
         .merge(testbed_admin::jobs_router(
             Arc::clone(&scheduler),
@@ -255,7 +267,10 @@ async fn main() {
         .merge(testbed_http::fault::guard(
             Arc::clone(&state),
             testbed_hooks::router(Arc::clone(&hooks.inbox)),
-        ));
+        ))
+        // Anything no router claimed. axum's default 404 is an empty body,
+        // which is indistinguishable from a broken server in a browser.
+        .fallback(testbed_admin::not_found);
 
     // `PORT` is the fallback because that is what every managed host injects
     // (Render, Fly, Heroku); `TESTBED_PORT` still wins so a local gate can move
